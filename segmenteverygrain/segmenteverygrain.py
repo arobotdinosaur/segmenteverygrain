@@ -2333,6 +2333,96 @@ def lineal_intercept_analysis(labeled_array, angle=0, n_lines=100, scale=1.0, sc
     return chord_lengths, mean_intercept
 
 
+def visualize_lineal_intercept(
+    image, labeled_array, angle=0, n_lines=20,
+    line_color="yellow", marker_color="red", linewidth=1.5,
+):
+    """
+    Overlay lineal intercept scan lines on the grain image.
+
+    Draws ``n_lines`` evenly-spaced parallel scan lines at ``angle`` degrees.
+    Segments that fall inside a grain are drawn in ``line_color``; the points
+    where each segment crosses a grain boundary are marked with
+    ``marker_color`` dots.  Faint white lines show the full extent of each
+    scan line for context.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Original image, shape (H, W) or (H, W, 3).
+    labeled_array : np.ndarray (int, 2-D)
+        Labeled grain array from ``sam_segmentation()`` / ``rasterize_grains()``,
+        with 0 = background and positive integers identifying each grain.
+    angle : float
+        Angle of scan lines in degrees, same convention as
+        ``lineal_intercept_analysis()``.
+    n_lines : int
+        Number of scan lines to draw.  10–30 is usually enough for a clear
+        visual without overcrowding the image.
+    line_color : str
+        Matplotlib colour for within-grain chord segments.
+    marker_color : str
+        Matplotlib colour for grain-boundary intersection dots.
+    linewidth : float
+        Width of the chord line segments in points.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    ax : matplotlib.axes.Axes
+    """
+    if angle != 0:
+        rotated_labels = ndi.rotate(
+            labeled_array.astype(float), -angle,
+            order=0, mode="constant", cval=0, reshape=True,
+        ).astype(labeled_array.dtype)
+        if image.ndim == 3:
+            rotated_image = np.stack([
+                ndi.rotate(image[..., c].astype(float), -angle,
+                           order=1, mode="constant", cval=0, reshape=True)
+                for c in range(image.shape[2])
+            ], axis=-1).astype(image.dtype)
+        else:
+            rotated_image = ndi.rotate(
+                image.astype(float), -angle,
+                order=1, mode="constant", cval=0, reshape=True,
+            ).astype(image.dtype)
+    else:
+        rotated_labels = labeled_array
+        rotated_image = image
+
+    h, w = rotated_labels.shape
+    row_indices = np.linspace(1, h - 2, n_lines, dtype=int)
+
+    fig, ax = plt.subplots(figsize=(12, 9))
+    ax.imshow(rotated_image, cmap="gray" if rotated_image.ndim == 2 else None)
+
+    for y in row_indices:
+        row = rotated_labels[y]
+        changes = np.where(np.diff(row) != 0)[0] + 1
+        starts = np.concatenate([[0], changes])
+        ends = np.concatenate([changes, [w]])
+        labels_at_starts = row[starts]
+
+        ax.plot([0, w - 1], [y, y], color="white", alpha=0.15,
+                linewidth=0.5, zorder=1)
+
+        for start, end, lbl in zip(starts, ends, labels_at_starts):
+            if lbl != 0:
+                ax.plot([start, end - 1], [y, y], color=line_color,
+                        linewidth=linewidth, alpha=0.85, zorder=2,
+                        solid_capstyle="butt")
+                ax.plot([start, end - 1], [y, y], ".",
+                        color=marker_color, markersize=4, zorder=3)
+
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(f"Lineal intercept — {n_lines} scan lines at {angle}°")
+    return fig, ax
+
+
 def plot_histogram_of_lineal_intercepts(
     chord_lengths, scale_unit="px", binsize=None, xlimits=None
 ):
