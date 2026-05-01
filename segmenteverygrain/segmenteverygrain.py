@@ -2430,6 +2430,113 @@ def astm_grain_size_number(mean_intercept_mm):
     return -6.644 * np.log2(mean_intercept_mm) - 3.288
 
 
+def pixel_area_analysis(labeled_array, pixel_size=1.0, pixel_unit="px"):
+    """
+    Compute grain areas and equivalent circular diameters by counting pixels.
+
+    Each grain's area is calculated as ``n_pixels × pixel_size²``.  The
+    equivalent circular diameter ``d = 2 √(A / π)`` gives a single linear
+    size that is directly comparable to the mean lineal intercept from
+    ``lineal_intercept_analysis()``.
+
+    Parameters
+    ----------
+    labeled_array : np.ndarray (int, 2-D)
+        Labeled grain image where 0 = background/boundary and each positive
+        integer identifies a unique grain, as returned by ``rasterize_grains()``.
+    pixel_size : float
+        Physical side length of one pixel (e.g. 5.582 for an SEM image
+        where each pixel is 5.582 nm × 5.582 nm).
+    pixel_unit : str
+        Label for the physical unit of ``pixel_size`` (e.g. ``'nm'``,
+        ``'μm'``, ``'mm'``).  Used only for display purposes.
+
+    Returns
+    -------
+    areas : np.ndarray
+        1-D array of grain areas in ``pixel_unit²``, one entry per grain.
+    equiv_diameters : np.ndarray
+        1-D array of equivalent circular diameters in ``pixel_unit``,
+        computed as ``2 × √(area / π)``.
+    """
+    counts = np.bincount(labeled_array.ravel())
+    grain_counts = counts[1:]                      # drop label 0 (background)
+    grain_counts = grain_counts[grain_counts > 0]  # drop unused label slots
+
+    areas = grain_counts.astype(float) * pixel_size ** 2
+    equiv_diameters = 2.0 * np.sqrt(areas / np.pi)
+    return areas, equiv_diameters
+
+
+def plot_histogram_of_grain_areas(areas, pixel_unit="px", binsize=None, xlimits=None):
+    """
+    Plot a histogram of grain areas from ``pixel_area_analysis()``.
+
+    Mirrors the visual style of ``plot_histogram_of_lineal_intercepts``:
+    a bar histogram with the mean marked by a dashed vertical line and an
+    empirical CDF overlaid on a secondary y-axis.
+
+    Parameters
+    ----------
+    areas : array-like
+        Grain areas in physical units, as returned by ``pixel_area_analysis()``.
+    pixel_unit : str
+        Unit label for the pixel edge length; the x-axis is labelled
+        ``pixel_unit²`` automatically.
+    binsize : float, optional
+        Bin width in the same area units.  Defaults to the Freedman-Diaconis
+        estimate.
+    xlimits : tuple of float, optional
+        ``(xmin, xmax)`` limits for the x-axis.  Defaults to
+        ``(0, 1.05 × max(areas))``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The figure object containing the plot.
+    ax : matplotlib.axes.Axes
+        The primary axes object (area histogram).
+    """
+    areas = np.asarray(areas, dtype=float)
+    mean_area = areas.mean()
+
+    if xlimits:
+        xmin, xmax = xlimits
+    else:
+        xmin, xmax = 0.0, areas.max() * 1.05
+
+    if binsize is None:
+        iqr = np.percentile(areas, 75) - np.percentile(areas, 25)
+        binsize = iqr / len(areas) ** (1.0 / 3.0)
+        if binsize == 0:
+            binsize = (xmax - xmin) / 60.0
+
+    bins = np.arange(xmin, xmax + binsize, binsize)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    n, _, _ = ax.hist(areas, bins=bins, color="tab:blue", alpha=0.7, zorder=2)
+    ax.axvline(
+        mean_area, color="k", linestyle="--", linewidth=1.5,
+        label=f"mean area = {mean_area:.3e} {pixel_unit}²",
+    )
+    ax.set_xlabel(f"grain area ({pixel_unit}²)")
+    ax.set_ylabel("count")
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(0, max(n) * 1.1)
+    ax.xaxis.set_major_formatter(plt.ScalarFormatter(useMathText=True))
+    ax.ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
+    ax.legend()
+
+    sorted_areas = np.sort(areas)
+    ecdf = np.arange(1, len(sorted_areas) + 1) / len(sorted_areas)
+    ax2 = ax.twinx()
+    ax2.plot(sorted_areas, ecdf, color="tab:red", linewidth=2, zorder=3)
+    ax2.set_ylim(0, 1)
+    ax2.set_ylabel("cumulative frequency (ECDF)")
+
+    return fig, ax
+
+
 def save_training_masks(image, image_pred, mask_all, out_stem):
     """
     Save the source image, UNet prediction mask, and SAM output mask to disk
