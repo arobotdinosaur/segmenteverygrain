@@ -2271,6 +2271,165 @@ def find_grain_size_classes(grain_size_classes, value1, value2, xlimits=None):
     return matching_classes, bounds
 
 
+def lineal_intercept_analysis(labeled_array, angle=0, n_lines=100, scale=1.0, scale_unit="px"):
+    """
+    Measure grain chord lengths using the lineal intercept method (ISO 643 / ASTM E112).
+
+    Casts ``n_lines`` parallel test lines across the image at ``angle`` degrees,
+    records each continuous run of pixels belonging to a single grain as one
+    chord, and returns all chord lengths together with the mean lineal intercept
+    l̄.  This mirrors the manual line-intercept procedure described in ISO 643
+    and ASTM E112, making the output directly comparable to those standards.
+
+    Parameters
+    ----------
+    labeled_array : np.ndarray (int, 2-D)
+        Labeled grain image where 0 = background/boundary and each positive
+        integer identifies a unique grain, as returned by ``rasterize_grains()``.
+    angle : float
+        Angle of the scan lines in degrees, measured counter-clockwise from
+        horizontal.  0 → horizontal lines; 90 → vertical lines.
+    n_lines : int
+        Number of evenly-spaced parallel scan lines to cast across the image.
+        More lines improve statistical coverage but increase runtime linearly.
+    scale : float
+        Physical size per pixel (e.g. 0.001 for 1 μm/px when the unit is mm).
+        All returned lengths are multiplied by this factor.
+    scale_unit : str
+        Label for the physical unit, used only for display purposes
+        (e.g. ``'mm'``, ``'μm'``, ``'px'``).
+
+    Returns
+    -------
+    chord_lengths : np.ndarray
+        1-D array of individual chord lengths in physical units.
+    mean_intercept : float
+        Mean lineal intercept length l̄ in physical units.
+    """
+    if angle != 0:
+        rotated = ndi.rotate(
+            labeled_array.astype(float), -angle,
+            order=0, mode="constant", cval=0, reshape=True,
+        ).astype(labeled_array.dtype)
+    else:
+        rotated = labeled_array
+
+    h, w = rotated.shape
+    row_indices = np.linspace(1, h - 2, n_lines, dtype=int)
+
+    chord_lengths = []
+    for y in row_indices:
+        row = rotated[y]
+        changes = np.where(np.diff(row) != 0)[0] + 1
+        starts = np.concatenate([[0], changes])
+        ends = np.concatenate([changes, [w]])
+        labels_at_starts = row[starts]
+        for start, end, lbl in zip(starts, ends, labels_at_starts):
+            if lbl != 0:
+                chord_lengths.append((end - start) * scale)
+
+    chord_lengths = np.array(chord_lengths, dtype=float)
+    mean_intercept = float(chord_lengths.mean()) if len(chord_lengths) > 0 else 0.0
+    return chord_lengths, mean_intercept
+
+
+def plot_histogram_of_lineal_intercepts(
+    chord_lengths, scale_unit="px", binsize=None, xlimits=None
+):
+    """
+    Plot a histogram of grain chord lengths from the lineal intercept method.
+
+    Mirrors the visual style of ``plot_histogram_of_axis_lengths`` but uses a
+    linear x-axis suitable for ISO 643 / ASTM E112 comparisons.  The mean
+    lineal intercept l̄ is marked with a dashed vertical line, and an empirical
+    CDF is overlaid on a secondary y-axis.
+
+    Parameters
+    ----------
+    chord_lengths : array-like
+        Chord lengths in physical units, as returned by
+        ``lineal_intercept_analysis()``.
+    scale_unit : str
+        Label for the physical unit shown on the x-axis.
+    binsize : float, optional
+        Bin width in physical units.  Defaults to the Freedman-Diaconis
+        estimate so bin width adapts to the spread of the data.
+    xlimits : tuple of float, optional
+        ``(xmin, xmax)`` limits for the x-axis in physical units.  When
+        omitted the axis extends from 0 to 105 % of the maximum chord length.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The figure object containing the plot.
+    ax : matplotlib.axes.Axes
+        The primary axes object (chord-length histogram).
+    """
+    chord_lengths = np.asarray(chord_lengths, dtype=float)
+    mean_ic = chord_lengths.mean()
+
+    if xlimits:
+        xmin, xmax = xlimits
+    else:
+        xmin, xmax = 0.0, chord_lengths.max() * 1.05
+
+    if binsize is None:
+        iqr = np.percentile(chord_lengths, 75) - np.percentile(chord_lengths, 25)
+        binsize = 2.0 * iqr / len(chord_lengths) ** (1.0 / 3.0)
+        if binsize == 0:
+            binsize = (xmax - xmin) / 30.0
+
+    bins = np.arange(xmin, xmax + binsize, binsize)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    n, _, _ = ax.hist(chord_lengths, bins=bins, color="tab:blue", alpha=0.7, zorder=2)
+    ax.axvline(
+        mean_ic, color="k", linestyle="--", linewidth=1.5,
+        label=f"mean intercept l̅ = {mean_ic:.4g} {scale_unit}",
+    )
+    ax.set_xlabel(f"chord length ({scale_unit})")
+    ax.set_ylabel("count")
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(0, max(n) * 1.1)
+    ax.legend()
+
+    sorted_cl = np.sort(chord_lengths)
+    ecdf = np.arange(1, len(sorted_cl) + 1) / len(sorted_cl)
+    ax2 = ax.twinx()
+    ax2.plot(sorted_cl, ecdf, color="tab:red", linewidth=2, zorder=3)
+    ax2.set_ylim(0, 1)
+    ax2.set_ylabel("cumulative frequency")
+
+    return fig, ax
+
+
+def astm_grain_size_number(mean_intercept_mm):
+    """
+    Compute the ASTM grain size number G from the mean lineal intercept.
+
+    Uses the relationship defined in ASTM E112 / ISO 643::
+
+        G = -6.644 * log2(l̄_mm) - 3.288
+
+    where l̄ is the mean lineal intercept in millimetres measured at 100×
+    magnification on the actual specimen surface.
+
+    Parameters
+    ----------
+    mean_intercept_mm : float
+        Mean lineal intercept in millimetres, as returned (after appropriate
+        unit conversion) by ``lineal_intercept_analysis()``.
+
+    Returns
+    -------
+    float
+        ASTM grain size number G.  Typical values range from 1 (coarse) to
+        10 (fine) for steel; values outside this range are extrapolated by
+        the same formula.
+    """
+    return -6.644 * np.log2(mean_intercept_mm) - 3.288
+
+
 def save_training_masks(image, image_pred, mask_all, out_stem):
     """
     Save the source image, UNet prediction mask, and SAM output mask to disk
