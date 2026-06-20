@@ -47,6 +47,7 @@ def generate_synthetic_images(
     output_folder="./noisy_output/",
     noise_reference_folder="./testnoisyimages/",
     seed=42,
+    n=1,
 ):
     if theta is None:
         params = NoiseParams(
@@ -66,37 +67,41 @@ def generate_synthetic_images(
         )
 
     pairs = load_image_mask_pairs(input_folder)
-    print(f"Found {len(pairs)} image-mask pairs")
+    print(f"Found {len(pairs)} image-mask pairs, generating n={n} variant(s) each")
 
     _, noise_paths = load_images_from_folder(noise_reference_folder)
     sample_noisy = cv2.imread(noise_paths[0], cv2.IMREAD_GRAYSCALE)
     target_shape = sample_noisy.shape
     print(f"Using target_shape from {noise_reference_folder}: {target_shape}")
 
-    rng = np.random.default_rng(seed)
     Path(output_folder).mkdir(parents=True, exist_ok=True)
 
+    total_saved = 0
     for img_path, mask_path in pairs:
         img_name = Path(img_path).stem
         base_name = img_name.replace("_image", "").replace("image", "")
         clean_img = load_image(img_path)
         clean_mask = load_image(mask_path)
 
-        noisy_img, mask_ds, _ = make_noisy_training_pair(
-            clean_img=clean_img,
-            clean_mask=clean_mask,
-            target_shape=target_shape,
-            params=params,
-            rng=rng,
-        )
+        for variant in range(n):
+            rng = np.random.default_rng(seed + variant + total_saved)
+            noisy_img, mask_ds, _ = make_noisy_training_pair(
+                clean_img=clean_img,
+                clean_mask=clean_mask,
+                target_shape=target_shape,
+                params=params,
+                rng=rng,
+            )
 
-        noisy_path = Path(output_folder) / f"{base_name}_image.png"
-        mask_path_out = Path(output_folder) / f"{base_name}_mask.png"
+            suffix = f"_n{variant:03d}" if n > 1 else ""
+            noisy_path = Path(output_folder) / f"{base_name}{suffix}_image.png"
+            mask_path_out = Path(output_folder) / f"{base_name}{suffix}_mask.png"
 
-        cv2.imwrite(str(noisy_path), (noisy_img * 255).astype(np.uint8))
-        cv2.imwrite(str(mask_path_out), (mask_ds * 255).astype(np.uint8))
-        print(f"Saved: {noisy_path}")
+            cv2.imwrite(str(noisy_path), (noisy_img * 255).astype(np.uint8))
+            cv2.imwrite(str(mask_path_out), (mask_ds * 255).astype(np.uint8))
+            total_saved += 1
 
+    print(f"Saved {total_saved} image-mask pair(s)")
     return output_folder
 
 

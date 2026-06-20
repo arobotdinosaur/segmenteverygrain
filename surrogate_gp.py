@@ -11,12 +11,15 @@ import cv2
 import shutil
 import copy
 import random
+import re
+from collections import defaultdict
 from pathlib import Path
 import segmenteverygrain as seg
 from create_synthetic_images import (
     generate_synthetic_images as generate_synthetic_images_from_script,
     load_image_mask_pairs,
 )
+from synthetic_noise import NoiseParams, synthetic_noise_model_input
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from glob import glob
@@ -24,6 +27,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 from scipy.stats import qmc
 
+import albumentations as A
 import json
 import torch
 from PIL import Image
@@ -31,6 +35,21 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 from keras.optimizers import Adam
 from segmenteverygrain.resnext_model import MaskingResNeXt, weighted_crossentropy_torch
+
+
+# Albumentations pipeline for real noisy image augmentation.
+real_noisy_aug = A.Compose([
+    A.Rotate(
+        limit=(-45, 45),
+        interpolation=cv2.INTER_LINEAR,
+        mask_interpolation=cv2.INTER_NEAREST,
+        border_mode=cv2.BORDER_REFLECT_101,
+        p=0.8,
+    ),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomCrop(height=256, width=256),
+])
 
 TARGET_PATH = "./real_noisy_images/"
 CLEAN_PATH = "./real_clean_images/"
@@ -44,6 +63,57 @@ def reset_dir(path):
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Region-grid utilities for on-the-fly real-noisy augmentation
+# ---------------------------------------------------------------------------
+
+def compute_crop_grid(height, width, crop_size=384, stride=192):
+    """Return list of (x, y) top-left corners for valid crop_size regions."""
+    positions = []
+    for y in range(0, height - crop_size + 1, stride):
+        for x in range(0, width - crop_size + 1, stride):
+            positions.append((x, y))
+    return positions
+
+
+def load_and_augment_real_noisy(img_path, mask_path, rx, ry, augment=True):
+    """Load a full image+m·ask, extract the (rx,ry) 384×384 region,
+    apply Albumentations → 256×256, and return (img, mask).
+
+    *img_path* and *mask_path* may be either Python strings/bytes or
+    tf.EagerTensor; *rx* and *ry* may be Python ints or tf.EagerTensor.
+    """
+    if hasattr(img_path, "numpy"):
+        img_path = img_path.numpy()
+    if hasattr(mask_path, "numpy"):
+        mask_path = mask_path.numpy()
+    if hasattr(rx, "numpy"):
+        rx = int(rx.numpy())
+    if hasattr(ry, "numpy"):
+        ry = int(ry.numpy())
+    img_path = img_path.decode() if isinstance(img_path, bytes) else str(img_path)
+    mask_path = mask_path.decode() if isinstance(mask_path, bytes) else str(mask_path)
+
+    img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE).astype(np.uint8)
+
+    crop_img = img[ry:ry + 384, rx:rx + 384]
+    crop_mask = mask[ry:ry + 384, rx:rx + 384]
+
+    if augment:
+        augmented = real_noisy_aug(image=crop_img, mask=crop_mask)
+        out_img = augmented["image"].astype(np.float32) / 255.0
+        out_mask = augmented["mask"]
+    else:
+        sy = (384 - 256) // 2
+        sx = (384 - 256) // 2
+        out_img = crop_img[sy:sy + 256, sx:sx + 256].astype(np.float32) / 255.0
+        out_mask = crop_mask[sy:sy + 256, sx:sx + 256]
+
+    return out_img, out_mask
 
 
 # Split-selected image/mask pairs into a fresh folder on disk.
@@ -124,9 +194,44 @@ class PatchDataset(Dataset):
         return img_t, mask_t
 
 
+# TensorFlow dataset builder for online synthetic noise.
+def build_synthetic_noise_dataset(image_files, mask_files, params, seed=None, batch_size=None):
+    """Build a TF dataset that applies synthetic noise on-the-fly to clean patches.
+
+    If *seed* is None, noise is fresh random each time (training).
+    If *seed* is an int, noise is reproducible (val/test).
+    """
+
+    def generator():
+        for img_path, mask_path in zip(image_files, mask_files):
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            local_rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+            noisy = synthetic_noise_model_input(img, params, local_rng)
+            noisy = np.stack([noisy] * 3, axis=-1).astype(np.float32)
+            mask_onehot = np.eye(3, dtype=np.float32)[mask]
+            yield noisy, mask_onehot
+
+    dataset = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=(
+            tf.TensorSpec(shape=(256, 256, 3), dtype=tf.float32),
+            tf.TensorSpec(shape=(256, 256, 3), dtype=tf.float32),
+        ),
+    )
+    if image_files:
+        dataset = dataset.apply(tf.data.experimental.assert_cardinality(len(image_files)))
+    if batch_size is not None:
+        dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+
 # TensorFlow dataset builder used by the Keras U-Net paths.
 def build_dataset(image_files, mask_files, augmentation=False, batch_size=32, shuffle_buffer=1000):
-    """Builds a TF dataset from image and mask file paths."""
+    """Builds a TF dataset from image and mask file paths.
+
+    If *batch_size* is None, returns unbatched elements.
+    """
     dataset = tf.data.Dataset.from_tensor_slices((image_files, mask_files))
 
     if augmentation:
@@ -137,7 +242,53 @@ def build_dataset(image_files, mask_files, augmentation=False, batch_size=32, sh
         ))
 
     dataset = dataset.map(seg.load_and_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.shuffle(shuffle_buffer).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    if batch_size is not None:
+        dataset = dataset.shuffle(shuffle_buffer).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+
+# TensorFlow dataset builder for region-based real noisy augmentation.
+def build_real_noisy_dataset(pairs, split, augment=True, batch_size=32, shuffle_buffer=1000):
+    """Build a TF dataset from region-assigned real noisy image pairs.
+
+    *pairs* is a list of dicts with keys: img_path, mask_path, x, y, split.
+    Filters to *split*, then applies load_and_augment_real_noisy via py_function.
+
+    If *batch_size* is None, returns an unbatched (element-level) dataset
+    suitable for concatenation before batching.
+    """
+    items = [p for p in pairs if p["split"] == split]
+    if not items:
+        return tf.data.Dataset.from_tensor_slices([])
+
+    img_paths = [p["img_path"] for p in items]
+    mask_paths = [p["mask_path"] for p in items]
+    xs = [p["x"] for p in items]
+    ys = [p["y"] for p in items]
+
+    def _map_fn(img_p, mask_p, rx, ry):
+        img_np, mask_np = tf.py_function(
+            lambda ip, mp, x, y: load_and_augment_real_noisy(ip, mp, x, y, augment),
+            [img_p, mask_p, rx, ry],
+            Tout=(tf.float32, tf.int64),
+        )
+        img_np.set_shape((256, 256, 3))
+        mask_np.set_shape((256, 256))
+        return img_np, mask_np
+
+    dataset = tf.data.Dataset.from_tensor_slices((img_paths, mask_paths, xs, ys))
+    dataset = dataset.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # One-hot encode the mask to depth 3 (background / grain / boundary).
+    def _onehot(img, mask):
+        mask = tf.one_hot(tf.cast(mask, tf.int32), depth=3, axis=-1)
+        mask = tf.reshape(mask, (256, 256, 3))
+        return img, mask
+
+    dataset = dataset.map(_onehot, num_parallel_calls=tf.data.AUTOTUNE)
+
+    if batch_size is not None:
+        dataset = dataset.shuffle(shuffle_buffer).batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return dataset
 
 
@@ -174,34 +325,40 @@ def train_model_on_resolutions(
     model_family="unet",
     model_weights_file="./models/seg_model.keras",
     use_pretrained=True,
+    loss = {seg.weighted_crossentropy:1,seg.dice_loss:0.5,seg.boundary_iou_loss:0.2},
+    n_crop_views=1,
+    noise_params=None,
+    combine_with_clean=False,
 ):
     """Train on synthetic multi-res patches and evaluate on held-out real noisy images."""
     workspace = Path(workspace)
     patch_dir = reset_dir(workspace / "patches")
 
-    syn_image_dir, syn_mask_dir = seg.patchify_training_data(str(synthetic_folder), Path(patch_dir) / "synthetic")
-    real_image_dir, real_mask_dir = seg.patchify_training_data(real_noisy_folder, Path(patch_dir) / "real")
-
-    syn_images = sorted(glob(syn_image_dir + "/*.png"))
-    syn_masks = sorted(glob(syn_mask_dir + "/*.png"))
-    real_images = sorted(glob(real_image_dir + "/*.png"))
-    real_masks = sorted(glob(real_mask_dir + "/*.png"))
-
-    train_val_syn_images, test_syn_images, train_val_syn_masks, test_syn_masks = train_test_split(
-        syn_images, syn_masks, test_size=0.15, random_state=42
+    # --- Synthetic: patchify clean images → group by source → split → online noise ---
+    syn_image_dir, syn_mask_dir = seg.patchify_training_data(
+        CLEAN_PATH, str(patch_dir / "clean_patches"),
     )
-    train_syn_images, val_syn_images, train_syn_masks, val_syn_masks = train_test_split(
-        train_val_syn_images, train_val_syn_masks, test_size=0.25, random_state=42
-    )
+    all_syn_images = sorted(glob(syn_image_dir + "/*.png"))
+    all_syn_masks = sorted(glob(syn_mask_dir + "/*.png"))
 
-    train_val_real_images, test_real_images, train_val_real_masks, test_real_masks = train_test_split(
-        real_images, real_masks, test_size=0.15, random_state=42
-    )
-    train_real_images, val_real_images, train_real_masks, val_real_masks = train_test_split(
-        train_val_real_images, train_val_real_masks, test_size=0.25, random_state=42
-    )
+    source_groups = defaultdict(list)
+    for img, msk in zip(all_syn_images, all_syn_masks):
+        src_key = Path(img).stem.rsplit("_patch", 1)[0]
+        source_groups[src_key].append((img, msk))
 
-    split_dir = Path(patch_dir) / "synthetic" / "Patches"
+    source_keys = list(source_groups.keys())
+    train_keys, test_keys = train_test_split(source_keys, test_size=0.15, random_state=42)
+    train_keys, val_keys = train_test_split(train_keys, test_size=0.25 / 0.85, random_state=42)
+
+    def _split_patches(keys):
+        items = [p for k in keys for p in source_groups[k]]
+        return [p[0] for p in items], [p[1] for p in items]
+
+    train_syn_images, train_syn_masks = _split_patches(train_keys)
+    val_syn_images, val_syn_masks = _split_patches(val_keys)
+    test_syn_images, test_syn_masks = _split_patches(test_keys)
+
+    split_dir = patch_dir / "clean_patches" / "Patches"
     train_dir = split_dir / "train"
     val_dir = split_dir / "val"
     test_dir = split_dir / "test"
@@ -213,23 +370,77 @@ def train_model_on_resolutions(
     print("Creating multi-resolution synthetic test data...")
     test_syn_images, test_syn_masks = create_scaled_variants(test_syn_images, test_syn_masks, scales, test_dir)
 
-    train_images = train_syn_images + train_real_images
-    train_masks = train_syn_masks + train_real_masks
-    val_images = val_syn_images + val_real_images
-    val_masks = val_syn_masks + val_real_masks
-    test_images = test_syn_images + test_real_images
-    test_masks = test_syn_masks + test_real_masks
+    # --- Real noisy: region-based Albumentations pipeline instead of patchify ---
+    # Assign entire images to splits to guarantee zero pixel leakage.
+    real_pairs = load_image_mask_pairs(real_noisy_folder)
+    n_images = len(real_pairs)
+    split_point = max(1, round(n_images * 0.75))
+    image_assignments = {}
+    for idx, (img_path, _) in enumerate(real_pairs):
+        image_assignments[img_path] = "train" if idx < split_point else "val"
 
-    print(f"Training: {len(train_images)} images ({len(train_syn_images)} synthetic + {len(train_real_images)} real)")
-    print(f"Validation: {len(val_images)} images ({len(val_syn_images)} synthetic + {len(val_real_images)} real)")
-    print(f"Test: {len(test_images)} images ({len(test_syn_images)} synthetic + {len(test_real_images)} real)")
+    pairs_with_regions = []
+    for img_path, mask_path in real_pairs:
+        height, width = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).shape
+        crop_positions = compute_crop_grid(height, width, crop_size=384, stride=128)
+        split_label = image_assignments[img_path]
+        for cx, cy in crop_positions:
+            pairs_with_regions.append({
+                "img_path": img_path,
+                "mask_path": mask_path,
+                "x": cx,
+                "y": cy,
+                "split": split_label,
+            })
+
+    # Replicate region entries so each region produces n_crop_views different
+    # random views (crop position, rotation, flips) per epoch.
+    if n_crop_views > 1:
+        pairs_with_regions = [
+            {**p, "crop_view_id": i}
+            for p in pairs_with_regions
+            for i in range(n_crop_views)
+        ]
+
+    n_train_real = sum(1 for p in pairs_with_regions if p["split"] == "train")
+    n_val_real = sum(1 for p in pairs_with_regions if p["split"] == "val")
+    print(f"Real noisy: {n_train_real} train regions + {n_val_real} val regions (from {len(real_pairs)} images, view_repeat={n_crop_views})")
+
+    print(f"Synthetic: {len(train_syn_images)} train, {len(val_syn_images)} val, {len(test_syn_images)} test")
 
     if model_family in {"unet", "unet_modified"}:
         # Keras path: either start from the repo constructors or fine-tune a saved model.
         print("Using Unet")
-        train_dataset = build_dataset(train_images, train_masks, augmentation=True)
-        val_dataset = build_dataset(val_images, val_masks, augmentation=False)
-        test_dataset = build_dataset(test_images, test_masks, augmentation=False)
+
+        if noise_params is not None:
+            syn_train_ds = build_synthetic_noise_dataset(
+                train_syn_images, train_syn_masks, noise_params, seed=None, batch_size=None,
+            )
+            syn_val_ds = build_synthetic_noise_dataset(
+                val_syn_images, val_syn_masks, noise_params, seed=42, batch_size=None,
+            )
+            syn_test_ds = build_synthetic_noise_dataset(
+                test_syn_images, test_syn_masks, noise_params, seed=42, batch_size=None,
+            )
+            if combine_with_clean:
+                clean_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
+                syn_train_ds = syn_train_ds.concatenate(clean_train_ds)
+        else:
+            syn_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
+            syn_val_ds = build_dataset(val_syn_images, val_syn_masks, augmentation=False, batch_size=None)
+            syn_test_ds = build_dataset(test_syn_images, test_syn_masks, augmentation=False)
+
+        real_train_ds = build_real_noisy_dataset(pairs_with_regions, "train", augment=True, batch_size=None)
+        real_val_ds = build_real_noisy_dataset(pairs_with_regions, "val", augment=False, batch_size=None)
+
+        # Combine synthetic + real at the element level, then shuffle + batch.
+        train_dataset = syn_train_ds.concatenate(real_train_ds)
+        train_dataset = train_dataset.shuffle(2000).batch(32).prefetch(tf.data.AUTOTUNE)
+
+        val_dataset = syn_val_ds.concatenate(real_val_ds)
+        val_dataset = val_dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
+
+        test_dataset = syn_test_ds.batch(32).prefetch(tf.data.AUTOTUNE)
 
         if use_pretrained:
             print("Using pretrained")
@@ -246,6 +457,7 @@ def train_model_on_resolutions(
                 save_plot_path=f"loss_plots/training_loss_plot_{model_name}.png",
                 show_plot=False,
                 use_reduce_lr=True,
+                loss = loss
             )
         else:
             if model_family == "unet_modified":
@@ -266,14 +478,14 @@ def train_model_on_resolutions(
         val_metrics = model.evaluate(val_dataset, verbose=0, return_dict=True)
         test_metrics = model.evaluate(test_dataset, verbose=0, return_dict=True)
     elif model_family == "resnext":
-        # Torch path: mirrors the notebook training template in callable form.
+        # Torch path: synthetic-only (real noisy augmentation is TF-specific).
         device = torch.device(
             "mps" if torch.backends.mps.is_available()
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        train_loader = DataLoader(PatchDataset(train_images, train_masks, augment=True), batch_size=8, shuffle=True, num_workers=0)
-        val_loader = DataLoader(PatchDataset(val_images, val_masks, augment=False), batch_size=8, shuffle=False, num_workers=0)
-        test_loader = DataLoader(PatchDataset(test_images, test_masks, augment=False), batch_size=8, shuffle=False, num_workers=0)
+        train_loader = DataLoader(PatchDataset(train_syn_images, train_syn_masks, augment=True), batch_size=8, shuffle=True, num_workers=0)
+        val_loader = DataLoader(PatchDataset(val_syn_images, val_syn_masks, augment=False), batch_size=8, shuffle=False, num_workers=0)
+        test_loader = DataLoader(PatchDataset(test_syn_images, test_syn_masks, augment=False), batch_size=8, shuffle=False, num_workers=0)
 
         model = MaskingResNeXt(num_classes=3, pretrained=use_pretrained).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -414,6 +626,8 @@ def black_box(
     count_weight=0.4,
     tag=None,
     combine_with_clean=False,
+    n_synthetic_variants=1,
+    n_crop_views=1,
 ):
     """Evaluate one candidate theta and return a single scalar score."""
     theta = np.asarray(theta, dtype=float)
@@ -429,29 +643,26 @@ def black_box(
         noise_reference_folder=TARGET_PATH,
         output_folder=workspace / "synthetic_noisy_images",
         seed=42,
+        n=n_synthetic_variants,
     )
 
-    if combine_with_clean:
-        combined_folder = workspace / "combined_training"
-        reset_dir(combined_folder)
-        for f in Path(CLEAN_PATH).iterdir():
-            shutil.copy2(f, combined_folder / f"clean_{f.name}")
-        for f in Path(synthetic_folder).iterdir():
-            shutil.copy2(f, combined_folder / f.name)
-        training_folder = str(combined_folder)
-        print(f"Combined clean + synthetic training folder: {training_folder}")
-    else:
-        training_folder = synthetic_folder
+    theta_params = NoiseParams(
+        a=float(theta[0]), b=float(theta[1]),
+        sigma_r=float(theta[2]), l=float(theta[3]), k=float(theta[4]),
+    )
 
     # 2) Train the chosen model family on synthetic patches and evaluate on real data.
     model, metrics = train_model_on_resolutions(
-        synthetic_folder = training_folder,
+        synthetic_folder = synthetic_folder,
         real_noisy_folder=TARGET_PATH,
         model_name=f"synthetic_blackbox_{tag}",
         workspace=workspace,
         model_family=model_family,
         model_weights_file=model_weights_file,
         use_pretrained=use_pretrained,
+        n_crop_views=n_crop_views,
+        noise_params=theta_params,
+        combine_with_clean=combine_with_clean,
     )
 
     # 3) Predict masks on PREDICT_PATH images and compare with ground truth masks.
@@ -566,6 +777,8 @@ def run_gp_loop(
     model_weights_file="./models/seg_model.keras",
     use_pretrained=True,
     combine_with_clean=False,
+    n_synthetic_variants=1,
+    n_crop_views=1,
 ):
     """Template Bayesian optimization loop around the expensive black box."""
     records, X_prev, y_prev = load_gp_data(data_path)
@@ -589,6 +802,8 @@ def run_gp_loop(
             use_pretrained=use_pretrained,
             tag="init",
             combine_with_clean=combine_with_clean,
+            n_synthetic_variants=n_synthetic_variants,
+            n_crop_views=n_crop_views,
         )
         y_train = np.array([summary["objective"]])
         records = [{"iteration": 0, "tag": "init", **summary}]
@@ -614,6 +829,8 @@ def run_gp_loop(
             use_pretrained=use_pretrained,
             tag=iter_tag,
             combine_with_clean=combine_with_clean,
+            n_synthetic_variants=n_synthetic_variants,
+            n_crop_views=n_crop_views,
         )
         print(f"Result: f(theta) = {summary['objective']:.6f}")
 
@@ -631,8 +848,15 @@ def run_gp_loop(
 if __name__ == "__main__":
     N_ITERATIONS = 100  # Change this to control how many searches to run
     COMBINE_WITH_CLEAN = True  # Set True to include pre-injection clean images in training
+    N_SYNTHETIC_VARIANTS = 8  # Number of noisy variants per clean image
+    N_CROP_VIEWS = 8  # Replicate each real-noisy crop region for more views per epoch
 
-    X_final, y_final = run_gp_loop(n_iterations=N_ITERATIONS, combine_with_clean=COMBINE_WITH_CLEAN)
+    X_final, y_final = run_gp_loop(
+        n_iterations=N_ITERATIONS,
+        combine_with_clean=COMBINE_WITH_CLEAN,
+        n_synthetic_variants=N_SYNTHETIC_VARIANTS,
+        n_crop_views=N_CROP_VIEWS,
+    )
 
     print("\n=== Final Results ===")
     for i in range(len(X_final)):

@@ -4,6 +4,7 @@ import os
 import json
 import sys
 from glob import glob
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -1080,6 +1081,99 @@ def weighted_crossentropy(y_true, y_pred):
     loss = tf.reduce_mean(weighted_losses)
     return loss
 
+def dice_loss(y_true, y_pred, smooth=1e-6):
+    """
+    Multiclass soft Dice loss.
+    y_true: one-hot labels
+    y_pred: raw logits
+    """
+    y_pred = tf.nn.softmax(y_pred, axis=-1)
+
+    intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2])
+    union = tf.reduce_sum(y_true + y_pred, axis=[1, 2])
+
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+
+    # average over classes and batch
+    return 1.0 - tf.reduce_mean(dice)
+
+def boundary_map(mask):
+    """
+    Computes soft boundary maps from segmentation masks.
+
+    Parameters
+    ----------
+    mask : tensor
+        Shape: (B, H, W, C)
+        One-hot labels or probabilities.
+
+    Returns
+    -------
+    boundary : tensor
+        Soft boundary map.
+    """
+
+    # vertical differences
+    dy = mask[:, 1:, :, :] - mask[:, :-1, :, :]
+
+    # horizontal differences
+    dx = mask[:, :, 1:, :] - mask[:, :, :-1, :]
+
+    # pad back to original size
+    dy = tf.pad(dy, [[0, 0], [0, 1], [0, 0], [0, 0]])
+    dx = tf.pad(dx, [[0, 0], [0, 0], [0, 1], [0, 0]])
+
+    # gradient magnitude
+    boundary = tf.sqrt(tf.square(dx) + tf.square(dy) + 1e-6)
+
+    return boundary
+
+
+def boundary_iou_loss(y_true, y_pred, smooth=1e-6):
+    """
+    Boundary IoU loss for multiclass segmentation.
+
+    Parameters
+    ----------
+    y_true : tensor
+        One-hot ground truth labels.
+        Shape: (B, H, W, C)
+
+    y_pred : tensor
+        Raw logits from model.
+        Shape: (B, H, W, C)
+
+    Returns
+    -------
+    loss : tensor
+        Boundary IoU loss.
+    """
+
+    # convert logits to probabilities
+    y_pred = tf.nn.softmax(y_pred, axis=-1)
+
+    # compute boundary maps
+    true_boundary = boundary_map(y_true)
+    pred_boundary = boundary_map(y_pred)
+
+    # intersection
+    intersection = tf.reduce_sum(
+        true_boundary * pred_boundary,
+        axis=[1, 2]
+    )
+
+    # union
+    union = tf.reduce_sum(
+        true_boundary + pred_boundary
+        - true_boundary * pred_boundary,
+        axis=[1, 2]
+    )
+
+    # boundary IoU
+    biou = (intersection + smooth) / (union + smooth)
+
+    # average over classes and batch
+    return 1.0 - tf.reduce_mean(biou)
 
 def plot_images_and_labels(img, label):
     """
@@ -1764,6 +1858,7 @@ def load_and_preprocess(image_path, mask_path, augmentations=False):
 
     # Normalize images
     image = tf.cast(image, tf.float32) / 255.0
+    image.set_shape((256, 256, 3))
 
     # Apply augmentations
     if augmentations:
@@ -1775,13 +1870,14 @@ def load_and_preprocess(image_path, mask_path, augmentations=False):
         image = tf.where(
             image > 1, tf.ones_like(image), image
         )  # clipping values larger than 1
-        seed = tf.random.uniform(shape=[], minval=0, maxval=1)
+        seed_h = tf.random.uniform(shape=[], minval=0, maxval=1)
         image = tf.cond(
-            seed < 0.5, lambda: tf.image.flip_left_right(image), lambda: image
+            seed_h < 0.5, lambda: tf.image.flip_left_right(image), lambda: image
         )
-        mask = tf.cond(seed < 0.5, lambda: tf.image.flip_left_right(mask), lambda: mask)
-        image = tf.cond(seed < 0.5, lambda: tf.image.flip_up_down(image), lambda: image)
-        mask = tf.cond(seed < 0.5, lambda: tf.image.flip_up_down(mask), lambda: mask)
+        mask = tf.cond(seed_h < 0.5, lambda: tf.image.flip_left_right(mask), lambda: mask)
+        seed_v = tf.random.uniform(shape=[], minval=0, maxval=1)
+        image = tf.cond(seed_v < 0.5, lambda: tf.image.flip_up_down(image), lambda: image)
+        mask = tf.cond(seed_v < 0.5, lambda: tf.image.flip_up_down(mask), lambda: mask)
 
     return image, mask
 
@@ -2396,7 +2492,9 @@ def patchify_training_data(input_dir, patch_dir):
         # Write patches to files
         for i in range(patches.shape[0]):
             im = np.asarray(patches[i, :, :, :]).astype("uint8")
-            imname = os.path.join(images_dir, "im%03d.png" % (start_no + i))
+            source_stem = Path(image).stem
+            common_stem = source_stem.replace("_image", "").replace("_mask", "").replace("image", "").replace("mask", "")
+            imname = os.path.join(images_dir, f"{common_stem}_patch{start_no + i:04d}.png")
             im = Image.fromarray(im.astype(np.uint8))
             im.save(imname)
         start_no = start_no + patches.shape[0]
@@ -2425,7 +2523,9 @@ def patchify_training_data(input_dir, patch_dir):
         # Write patches to files
         for i in range(patches.shape[0]):
             im = np.asarray(patches[i, :, :, 0]).astype("uint8")
-            imname = os.path.join(labels_dir, "im%03d.png" % (start_no + i))
+            source_stem = Path(image).stem
+            common_stem = source_stem.replace("_image", "").replace("_mask", "").replace("image", "").replace("mask", "")
+            imname = os.path.join(labels_dir, f"{common_stem}_patch{start_no + i:04d}.png")
             im = Image.fromarray(im.astype(np.uint8))
             im.save(imname)
         start_no = start_no + patches.shape[0]
@@ -2568,6 +2668,37 @@ def create_and_train_model(
     model.evaluate(test_dataset)
     return model
 
+def _build_combined_loss(loss_dict):
+    """
+    Build a combined loss function from a dictionary of {loss_fn: weight}.
+
+    Parameters
+    ----------
+    loss_dict : dict
+        Mapping of callable loss functions to their weights, e.g.
+        ``{weighted_crossentropy: 0.7, dice_coefficient_loss: 0.3}``.
+
+    Returns
+    -------
+    callable
+        A loss function ``combined_loss(y_true, y_pred)`` that returns the
+        weighted sum of the individual losses.
+    """
+    losses = list(loss_dict.keys())
+    weights = list(loss_dict.values())
+
+    def combined_loss(y_true, y_pred):
+        total = 0.0
+        for loss_fn, w in zip(losses, weights):
+            total = total + w * loss_fn(y_true, y_pred)
+        return total
+
+    combined_loss.__name__ = "_combined_loss_" + "_".join(
+        l.__name__ if hasattr(l, "__name__") else str(l) for l in losses
+    )
+    return combined_loss
+
+
 def create_and_train_model_from_pretrained(
     pretrained_model_file,
     train_dataset,
@@ -2578,7 +2709,8 @@ def create_and_train_model_from_pretrained(
     model_type="unet",
     save_plot_path="training_loss_plot.png",
     show_plot=True,
-    use_reduce_lr = False
+    use_reduce_lr=False,
+    loss="weighted_crossentropy",
 ):
     """
     Load a pretrained model and fine-tune it on new training data.
@@ -2603,6 +2735,14 @@ def create_and_train_model_from_pretrained(
         Path to save the training loss plot (default is "training_loss_plot.png").
     show_plot : bool, optional
         Whether to display the plot (default is True). Set to False when using non-interactive backends.
+    use_reduce_lr : bool, optional
+        Whether to use ReduceLROnPlateau callback (default is False).
+    loss : str, callable, or dict, optional
+        Loss function to use. Can be:
+        - ``"weighted_crossentropy"`` (default): uses the built-in weighted cross-entropy.
+        - A callable loss function ``fn(y_true, y_pred)``.
+        - A dict mapping callable loss functions to their weights, e.g.
+          ``{weighted_crossentropy: 0.7, my_other_loss: 0.3}``.
 
     Returns
     -------
@@ -2614,9 +2754,25 @@ def create_and_train_model_from_pretrained(
     else:
         base_model = Unet()
 
+    custom_objects = {"weighted_crossentropy": weighted_crossentropy}
+
+    # Resolve the loss function
+    if isinstance(loss, dict):
+        loss_fn = _build_combined_loss(loss)
+        for l in loss:
+            if hasattr(l, "__name__"):
+                custom_objects[l.__name__] = l
+    elif callable(loss):
+        loss_fn = loss
+        if hasattr(loss, "__name__"):
+            custom_objects[loss.__name__] = loss
+    else:
+        # string like "weighted_crossentropy"
+        loss_fn = weighted_crossentropy
+
     pretrained_model = load_model(
         pretrained_model_file,
-        custom_objects={"weighted_crossentropy": weighted_crossentropy},
+        custom_objects=custom_objects,
     )
 
     for layer in base_model.layers:
@@ -2628,7 +2784,7 @@ def create_and_train_model_from_pretrained(
 
     base_model.compile(
         optimizer=Adam(learning_rate=learning_rate),
-        loss=weighted_crossentropy,
+        loss=loss_fn,
         metrics=["accuracy"],
     )
 

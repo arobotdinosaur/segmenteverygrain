@@ -18,14 +18,15 @@ from surrogate_gp import evaluate_model_masks, compute_mask_loss, dice_loss, cou
 # Path to a trained model file.
 #   For unet / unet_modified  → .keras file saved by train_model_on_resolutions
 #   For resnext               → .pth  file saved by train_model_on_resolutions
-MODEL_PATH = "./models/clean_blackbox.keras"  # <-- set this
+MODEL_PATH = "./models_recovered/synthetic_blackbox_iter_208.keras"  # <-- set this
+#MODEL_PATH = "./models/clean_blackbox.keras"
 
 # Directory of clean (or synthetic) images with ground-truth masks.
 #   Must contain paired image/mask files using the same convention as
 #   load_image_mask_pairs: masks have "_mask" in the filename,
 #   images do not.  PNG, JPG, or TIFF.
 #IMAGE_DIR = "./prediction_noisy_images/"  # <-- set this
-IMAGE_DIR = "./real_clean_images/"
+IMAGE_DIR = "./prediction_noisy_images/"
 
 # Temporary workspace (will be created/deleted each run).
 PATCH_DIR = "./sanity_check_workspace"
@@ -91,9 +92,11 @@ combos = [
     (1.0, 0.05),
     (1.0, 0.1),
     (1.0, 0.2),
+    (1.0, 0.4),
     (1.0, 0.5),
     (1.0, 0.5996),
     (1.0, 1.0),
+    (1.0, 3.1664),
     (0.5, 0.1),
     (0.5, 0.5),
     (0.2, 1.0),
