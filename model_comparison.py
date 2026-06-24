@@ -29,6 +29,7 @@ MODELS = [
     ("modelep30lr3", "./models/modelep30lr3.keras", "unet"),
     ("iter_293", "./models/synthetic_blackbox_iter_293.keras", "unet"),
     ("no_rock","./models/seg_model_alumina_only.keras", "unet"),
+    ("blackbox_clean","./models/clean_blackbox.keras", "unet"),
 ]
 
 IMAGE_DIR = "./test_only_noisy_images/"
