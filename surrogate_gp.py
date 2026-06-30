@@ -195,22 +195,26 @@ class PatchDataset(Dataset):
 
 
 # TensorFlow dataset builder for online synthetic noise.
-def build_synthetic_noise_dataset(image_files, mask_files, params, seed=None, batch_size=None):
+def build_synthetic_noise_dataset(image_files, mask_files, params, n_variants=8, seed=None, batch_size=None):
     """Build a TF dataset that applies synthetic noise on-the-fly to clean patches.
+
+    Each clean patch yields *n_variants* noisy versions per epoch,
+    each with independent noise.
 
     If *seed* is None, noise is fresh random each time (training).
     If *seed* is an int, noise is reproducible (val/test).
     """
 
     def generator():
+        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         for img_path, mask_path in zip(image_files, mask_files):
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            local_rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
-            noisy = synthetic_noise_model_input(img, params, local_rng)
-            noisy = np.stack([noisy] * 3, axis=-1).astype(np.float32)
             mask_onehot = np.eye(3, dtype=np.float32)[mask]
-            yield noisy, mask_onehot
+            for _ in range(n_variants):
+                noisy = synthetic_noise_model_input(img, params, rng)
+                noisy = np.stack([noisy] * 3, axis=-1).astype(np.float32)
+                yield noisy, mask_onehot
 
     dataset = tf.data.Dataset.from_generator(
         generator,
@@ -220,7 +224,7 @@ def build_synthetic_noise_dataset(image_files, mask_files, params, seed=None, ba
         ),
     )
     if image_files:
-        dataset = dataset.apply(tf.data.experimental.assert_cardinality(len(image_files)))
+        dataset = dataset.apply(tf.data.experimental.assert_cardinality(len(image_files) * n_variants))
     if batch_size is not None:
         dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return dataset
@@ -626,8 +630,8 @@ def black_box(
     count_weight=0.4,
     tag=None,
     combine_with_clean=False,
-    n_synthetic_variants=1,
-    n_crop_views=1,
+    n_synthetic_variants=8,
+    n_crop_views=8,
 ):
     """Evaluate one candidate theta and return a single scalar score."""
     theta = np.asarray(theta, dtype=float)
@@ -777,8 +781,8 @@ def run_gp_loop(
     model_weights_file="./models/seg_model.keras",
     use_pretrained=True,
     combine_with_clean=False,
-    n_synthetic_variants=1,
-    n_crop_views=1,
+    n_synthetic_variants=8,
+    n_crop_views=8,
 ):
     """Template Bayesian optimization loop around the expensive black box."""
     records, X_prev, y_prev = load_gp_data(data_path)
