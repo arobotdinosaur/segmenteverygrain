@@ -32,7 +32,7 @@ MODELS = [
     ("blackbox_clean","./models/clean_blackbox.keras", "unet"),
 ]
 
-IMAGE_DIR = "./test_only_noisy_images/"
+IMAGE_DIR = "./test_only_clean_images/"
 PATCH_DIR = "./model_comparison_workspace"
 OUTPUT_DIR = "./model_comparison_metrics"   # where per-model CSV files are saved
 SHOW_PLOTS = True
