@@ -333,6 +333,8 @@ def train_model_on_resolutions(
     n_crop_views=1,
     noise_params=None,
     combine_with_clean=False,
+    augment_clean=False,
+    augment_noisy=True,
 ):
     """Train on synthetic multi-res patches and evaluate on held-out real noisy images."""
     workspace = Path(workspace)
@@ -376,39 +378,75 @@ def train_model_on_resolutions(
 
     # --- Real noisy: region-based Albumentations pipeline instead of patchify ---
     # Assign entire images to splits to guarantee zero pixel leakage.
-    real_pairs = load_image_mask_pairs(real_noisy_folder)
-    n_images = len(real_pairs)
-    split_point = max(1, round(n_images * 0.75))
-    image_assignments = {}
-    for idx, (img_path, _) in enumerate(real_pairs):
-        image_assignments[img_path] = "train" if idx < split_point else "val"
-
     pairs_with_regions = []
-    for img_path, mask_path in real_pairs:
-        height, width = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).shape
-        crop_positions = compute_crop_grid(height, width, crop_size=384, stride=128)
-        split_label = image_assignments[img_path]
-        for cx, cy in crop_positions:
-            pairs_with_regions.append({
-                "img_path": img_path,
-                "mask_path": mask_path,
-                "x": cx,
-                "y": cy,
-                "split": split_label,
-            })
+    if augment_noisy:
+        real_pairs = load_image_mask_pairs(real_noisy_folder)
+        n_images = len(real_pairs)
+        split_point = max(1, round(n_images * 0.75))
+        image_assignments = {}
+        for idx, (img_path, _) in enumerate(real_pairs):
+            image_assignments[img_path] = "train" if idx < split_point else "val"
 
-    # Replicate region entries so each region produces n_crop_views different
-    # random views (crop position, rotation, flips) per epoch.
-    if n_crop_views > 1:
-        pairs_with_regions = [
-            {**p, "crop_view_id": i}
-            for p in pairs_with_regions
-            for i in range(n_crop_views)
-        ]
+        for img_path, mask_path in real_pairs:
+            height, width = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).shape
+            crop_positions = compute_crop_grid(height, width, crop_size=384, stride=128)
+            split_label = image_assignments[img_path]
+            for cx, cy in crop_positions:
+                pairs_with_regions.append({
+                    "img_path": img_path,
+                    "mask_path": mask_path,
+                    "x": cx,
+                    "y": cy,
+                    "split": split_label,
+                })
 
-    n_train_real = sum(1 for p in pairs_with_regions if p["split"] == "train")
-    n_val_real = sum(1 for p in pairs_with_regions if p["split"] == "val")
-    print(f"Real noisy: {n_train_real} train regions + {n_val_real} val regions (from {len(real_pairs)} images, view_repeat={n_crop_views})")
+        # Replicate region entries so each region produces n_crop_views different
+        # random views (crop position, rotation, flips) per epoch.
+        if n_crop_views > 1:
+            pairs_with_regions = [
+                {**p, "crop_view_id": i}
+                for p in pairs_with_regions
+                for i in range(n_crop_views)
+            ]
+
+        n_train_real = sum(1 for p in pairs_with_regions if p["split"] == "train")
+        n_val_real = sum(1 for p in pairs_with_regions if p["split"] == "val")
+        print(f"Real noisy: {n_train_real} train regions + {n_val_real} val regions (from {len(real_pairs)} images, view_repeat={n_crop_views})")
+
+    # --- Clean: region-based Albumentations augmentation (no synthetic noise) ---
+    clean_region_pairs = []
+    if augment_clean:
+        clean_pairs = load_image_mask_pairs(CLEAN_PATH)
+        for img_path, mask_path in clean_pairs:
+            src_key = Path(img_path).stem.replace("_image", "").replace("_mask", "").replace("image", "").replace("mask", "")
+            height, width = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).shape
+            crop_positions = compute_crop_grid(height, width, crop_size=384, stride=128)
+            if src_key in train_keys:
+                split_label = "train"
+            elif src_key in val_keys:
+                split_label = "val"
+            elif src_key in test_keys:
+                split_label = "test"
+            else:
+                print(f"  Warning: clean image {img_path} (key={src_key}) not found in splits, skipping")
+                continue
+            for cx, cy in crop_positions:
+                clean_region_pairs.append({
+                    "img_path": img_path,
+                    "mask_path": mask_path,
+                    "x": cx,
+                    "y": cy,
+                    "split": split_label,
+                })
+        if n_crop_views > 1:
+            clean_region_pairs = [
+                {**p, "crop_view_id": i}
+                for p in clean_region_pairs
+                for i in range(n_crop_views)
+            ]
+        n_train_clean = sum(1 for p in clean_region_pairs if p["split"] == "train")
+        n_val_clean = sum(1 for p in clean_region_pairs if p["split"] == "val")
+        print(f"Clean augmented: {n_train_clean} train regions + {n_val_clean} val regions (from {len(clean_pairs)} images, view_repeat={n_crop_views})")
 
     print(f"Synthetic: {len(train_syn_images)} train, {len(val_syn_images)} val, {len(test_syn_images)} test")
 
@@ -434,14 +472,30 @@ def train_model_on_resolutions(
             syn_val_ds = build_dataset(val_syn_images, val_syn_masks, augmentation=False, batch_size=None)
             syn_test_ds = build_dataset(test_syn_images, test_syn_masks, augmentation=False)
 
-        real_train_ds = build_real_noisy_dataset(pairs_with_regions, "train", augment=True, batch_size=None)
-        real_val_ds = build_real_noisy_dataset(pairs_with_regions, "val", augment=False, batch_size=None)
+        if augment_noisy:
+            real_train_ds = build_real_noisy_dataset(pairs_with_regions, "train", augment=True, batch_size=None)
+            real_val_ds = build_real_noisy_dataset(pairs_with_regions, "val", augment=False, batch_size=None)
 
-        # Combine synthetic + real at the element level, then shuffle + batch.
-        train_dataset = syn_train_ds.concatenate(real_train_ds)
+        # Build training streams: synthetic + (optional clean) + (optional real noisy).
+        streams_train = [syn_train_ds]
+        streams_val = [syn_val_ds]
+        if augment_clean:
+            clean_train_ds = build_real_noisy_dataset(clean_region_pairs, "train", augment=True, batch_size=None)
+            clean_val_ds = build_real_noisy_dataset(clean_region_pairs, "val", augment=False, batch_size=None)
+            streams_train.append(clean_train_ds)
+            streams_val.append(clean_val_ds)
+        if augment_noisy:
+            streams_train.append(real_train_ds)
+            streams_val.append(real_val_ds)
+
+        train_dataset = streams_train[0]
+        for ds in streams_train[1:]:
+            train_dataset = train_dataset.concatenate(ds)
         train_dataset = train_dataset.shuffle(2000).batch(32).prefetch(tf.data.AUTOTUNE)
 
-        val_dataset = syn_val_ds.concatenate(real_val_ds)
+        val_dataset = streams_val[0]
+        for ds in streams_val[1:]:
+            val_dataset = val_dataset.concatenate(ds)
         val_dataset = val_dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
 
         test_dataset = syn_test_ds.batch(32).prefetch(tf.data.AUTOTUNE)
@@ -630,6 +684,8 @@ def black_box(
     count_weight=0.4,
     tag=None,
     combine_with_clean=False,
+    augment_clean=True,
+    augment_noisy=True,
     n_synthetic_variants=8,
     n_crop_views=8,
 ):
@@ -667,6 +723,8 @@ def black_box(
         n_crop_views=n_crop_views,
         noise_params=theta_params,
         combine_with_clean=combine_with_clean,
+        augment_clean=augment_clean,
+        augment_noisy=augment_noisy,
     )
 
     # 3) Predict masks on PREDICT_PATH images and compare with ground truth masks.
@@ -781,6 +839,8 @@ def run_gp_loop(
     model_weights_file="./models/seg_model.keras",
     use_pretrained=True,
     combine_with_clean=False,
+    augment_clean=True,
+    augment_noisy=True,
     n_synthetic_variants=8,
     n_crop_views=8,
 ):
@@ -806,6 +866,8 @@ def run_gp_loop(
             use_pretrained=use_pretrained,
             tag="init",
             combine_with_clean=combine_with_clean,
+            augment_clean=augment_clean,
+            augment_noisy=augment_noisy,
             n_synthetic_variants=n_synthetic_variants,
             n_crop_views=n_crop_views,
         )
@@ -833,6 +895,8 @@ def run_gp_loop(
             use_pretrained=use_pretrained,
             tag=iter_tag,
             combine_with_clean=combine_with_clean,
+            augment_clean=augment_clean,
+            augment_noisy=augment_noisy,
             n_synthetic_variants=n_synthetic_variants,
             n_crop_views=n_crop_views,
         )
@@ -852,12 +916,16 @@ def run_gp_loop(
 if __name__ == "__main__":
     N_ITERATIONS = 100  # Change this to control how many searches to run
     COMBINE_WITH_CLEAN = True  # Set True to include pre-injection clean images in training
+    AUGMENT_CLEAN = True  # Set True to apply Albumentations spatial augmentation to real clean images
+    AUGMENT_NOISY = True  # Set True to apply Albumentations spatial augmentation to real noisy images
     N_SYNTHETIC_VARIANTS = 8  # Number of noisy variants per clean image
     N_CROP_VIEWS = 8  # Replicate each real-noisy crop region for more views per epoch
 
     X_final, y_final = run_gp_loop(
         n_iterations=N_ITERATIONS,
         combine_with_clean=COMBINE_WITH_CLEAN,
+        augment_clean=AUGMENT_CLEAN,
+        augment_noisy=AUGMENT_NOISY,
         n_synthetic_variants=N_SYNTHETIC_VARIANTS,
         n_crop_views=N_CROP_VIEWS,
     )
