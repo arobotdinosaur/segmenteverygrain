@@ -353,8 +353,7 @@ def train_model_on_resolutions(
         source_groups[src_key].append((img, msk))
 
     source_keys = list(source_groups.keys())
-    train_keys, test_keys = train_test_split(source_keys, test_size=0.15, random_state=42)
-    train_keys, val_keys = train_test_split(train_keys, test_size=0.25 / 0.85, random_state=42)
+    train_keys, val_keys = train_test_split(source_keys, test_size=0.25, random_state=42)
 
     def _split_patches(keys):
         items = [p for k in keys for p in source_groups[k]]
@@ -362,19 +361,15 @@ def train_model_on_resolutions(
 
     train_syn_images, train_syn_masks = _split_patches(train_keys)
     val_syn_images, val_syn_masks = _split_patches(val_keys)
-    test_syn_images, test_syn_masks = _split_patches(test_keys)
 
     split_dir = patch_dir / "clean_patches" / "Patches"
     train_dir = split_dir / "train"
     val_dir = split_dir / "val"
-    test_dir = split_dir / "test"
 
     print("Creating multi-resolution synthetic training data...")
     train_syn_images, train_syn_masks = create_scaled_variants(train_syn_images, train_syn_masks, scales, train_dir)
     print("Creating multi-resolution synthetic validation data...")
     val_syn_images, val_syn_masks = create_scaled_variants(val_syn_images, val_syn_masks, scales, val_dir)
-    print("Creating multi-resolution synthetic test data...")
-    test_syn_images, test_syn_masks = create_scaled_variants(test_syn_images, test_syn_masks, scales, test_dir)
 
     # --- Real noisy: region-based Albumentations pipeline instead of patchify ---
     # Assign entire images to splits to guarantee zero pixel leakage.
@@ -425,8 +420,6 @@ def train_model_on_resolutions(
                 split_label = "train"
             elif src_key in val_keys:
                 split_label = "val"
-            elif src_key in test_keys:
-                split_label = "test"
             else:
                 print(f"  Warning: clean image {img_path} (key={src_key}) not found in splits, skipping")
                 continue
@@ -448,7 +441,7 @@ def train_model_on_resolutions(
         n_val_clean = sum(1 for p in clean_region_pairs if p["split"] == "val")
         print(f"Clean augmented: {n_train_clean} train regions + {n_val_clean} val regions (from {len(clean_pairs)} images, view_repeat={n_crop_views})")
 
-    print(f"Synthetic: {len(train_syn_images)} train, {len(val_syn_images)} val, {len(test_syn_images)} test")
+    print(f"Synthetic: {len(train_syn_images)} train, {len(val_syn_images)} val")
 
     if model_family in {"unet", "unet_modified"}:
         # Keras path: either start from the repo constructors or fine-tune a saved model.
@@ -461,16 +454,12 @@ def train_model_on_resolutions(
             syn_val_ds = build_synthetic_noise_dataset(
                 val_syn_images, val_syn_masks, noise_params, seed=42, batch_size=None,
             )
-            syn_test_ds = build_synthetic_noise_dataset(
-                test_syn_images, test_syn_masks, noise_params, seed=42, batch_size=None,
-            )
             if combine_with_clean:
                 clean_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
                 syn_train_ds = syn_train_ds.concatenate(clean_train_ds)
         else:
             syn_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
             syn_val_ds = build_dataset(val_syn_images, val_syn_masks, augmentation=False, batch_size=None)
-            syn_test_ds = build_dataset(test_syn_images, test_syn_masks, augmentation=False)
 
         if augment_noisy:
             real_train_ds = build_real_noisy_dataset(pairs_with_regions, "train", augment=True, batch_size=None)
@@ -498,8 +487,6 @@ def train_model_on_resolutions(
             val_dataset = val_dataset.concatenate(ds)
         val_dataset = val_dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
 
-        test_dataset = syn_test_ds.batch(32).prefetch(tf.data.AUTOTUNE)
-
         if use_pretrained:
             print("Using pretrained")
             if model_weights_file is None:
@@ -508,7 +495,7 @@ def train_model_on_resolutions(
                 model_weights_file,
                 train_dataset,
                 val_dataset,
-                test_dataset,
+                test_dataset=None,
                 epochs=100,
                 learning_rate=1e-2,
                 model_type=model_family,
@@ -528,13 +515,11 @@ def train_model_on_resolutions(
                 metrics=["accuracy"],
             )
             model.fit(train_dataset, epochs=80, validation_data=val_dataset)
-            model.evaluate(test_dataset, verbose=0)
 
         model_path = Path("models") / f"{model_name}.keras"
         model.save(model_path)
 
         val_metrics = model.evaluate(val_dataset, verbose=0, return_dict=True)
-        test_metrics = model.evaluate(test_dataset, verbose=0, return_dict=True)
     elif model_family == "resnext":
         # Torch path: synthetic-only (real noisy augmentation is TF-specific).
         device = torch.device(
@@ -543,7 +528,6 @@ def train_model_on_resolutions(
         )
         train_loader = DataLoader(PatchDataset(train_syn_images, train_syn_masks, augment=True), batch_size=8, shuffle=True, num_workers=0)
         val_loader = DataLoader(PatchDataset(val_syn_images, val_syn_masks, augment=False), batch_size=8, shuffle=False, num_workers=0)
-        test_loader = DataLoader(PatchDataset(test_syn_images, test_syn_masks, augment=False), batch_size=8, shuffle=False, num_workers=0)
 
         model = MaskingResNeXt(num_classes=3, pretrained=use_pretrained).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -576,7 +560,6 @@ def train_model_on_resolutions(
         torch.save(model.state_dict(), model_path)
 
         val_metrics = evaluate_torch_model(model, val_loader, device)
-        test_metrics = evaluate_torch_model(model, test_loader, device)
     else:
         raise ValueError(
             f"Unsupported model_family '{model_family}'. "
@@ -585,8 +568,6 @@ def train_model_on_resolutions(
     metrics = {
         "val_loss": float(val_metrics["loss"]),
         "val_accuracy": float(val_metrics["accuracy"]),
-        "test_loss": float(test_metrics["loss"]),
-        "test_accuracy": float(test_metrics["accuracy"]),
         "model_path": str(model_path),
     }
     return model, metrics
@@ -755,10 +736,9 @@ def black_box(
         "Black-box metrics: "
         f"objective={objective_value:.6f}, "
         f"val_loss={metrics['val_loss']:.6f}, "
-        f"test_loss={metrics['test_loss']:.6f}, "
         f"dice={dice_loss(pred_probs, true_masks):.6f}, "
         f"count_pen={count_penalty(pred_probs, true_masks):.6f}, "
-        f"test_accuracy={metrics['test_accuracy']:.6f}"
+        f"val_accuracy={metrics['val_accuracy']:.6f}"
     )
     return summary
 

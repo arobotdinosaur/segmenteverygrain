@@ -2810,7 +2810,8 @@ def create_and_train_model_from_pretrained(
     plt.savefig(save_plot_path, dpi=150)
     if show_plot:
         plt.show()
-    base_model.evaluate(test_dataset)
+    if test_dataset is not None:
+        base_model.evaluate(test_dataset)
     return base_model
 
 def save_polygons(polygons, fname):
