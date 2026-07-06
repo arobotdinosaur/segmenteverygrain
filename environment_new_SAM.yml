@@ -1,0 +1,29 @@
+name: segmenteverygrain_new_SAM
+
+channels:
+  - conda-forge
+
+# Environment for running SAM 3 (Segment Anything Model 3) automatic mask
+# generation, e.g. SAM3_clean_grains.ipynb. SAM 3 is served through the Hugging
+# Face `transformers` mask-generation pipeline and needs transformers >= 5.12,
+# which requires a modern Python/torch stack (hence a separate env from the
+# python 3.9 `segmenteverygrain` env).
+dependencies:
+  - python=3.11
+  - pip
+  - jupyterlab
+  - ipykernel
+  - numpy
+  - scipy
+  - pandas
+  - scikit-image
+  - matplotlib
+  - pillow
+  - tqdm
+  - pip:
+    - "transformers>=5.12"
+    - torch
+    - torchvision
+    - accelerate
+    - safetensors
+    - huggingface_hub
