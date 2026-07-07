@@ -25,10 +25,14 @@ from create_synthetic_images import load_image_mask_pairs
 # Each entry: (display_name, model_path, model_family)
 #   model_family options: "unet", "unet_modified", "resnext"
 MODELS = [
-    ("Baseline", "./models_recovered/synthetic_blackbox_iter_208.keras", "unet"),
+    ("iter_208", "./models/synthetic_blackbox_iter_208.keras", "unet"),
+    ("modelep30lr3", "./models/modelep30lr3.keras", "unet"),
+    ("iter_293", "./models/synthetic_blackbox_iter_293.keras", "unet"),
+    ("no_rock","./models/seg_model_alumina_only.keras", "unet"),
+    ("blackbox_clean","./models/clean_blackbox.keras", "unet"),
 ]
 
-IMAGE_DIR = "./prediction_noisy_images/"
+IMAGE_DIR = "./test_05"
 PATCH_DIR = "./model_comparison_workspace"
 OUTPUT_DIR = "./model_comparison_metrics"   # where per-model CSV files are saved
 SHOW_PLOTS = True
@@ -124,18 +128,19 @@ def _grain_instances(masks):
 
 
 def _overlap_matrix(inst_pred, inst_true):
-    """Build overlap matrix: rows=true grains, cols=predicted grains."""
-    n_true = inst_true.max()
-    n_pred = inst_pred.max()
+    """Build overlap matrix: rows=true grains, cols=predicted grains.
+
+    overlap[t-1, p-1] = number of pixels where inst_true == t and inst_pred == p.
+    Computed as a single 2-D histogram over the labels so cost is one pass over
+    the image rather than O(n_true * n_pred) full-image boolean ANDs.
+    """
+    n_true = int(inst_true.max())
+    n_pred = int(inst_pred.max())
     if n_true == 0 or n_pred == 0:
         return np.zeros((n_true, n_pred)) if n_true > 0 else np.zeros((1, n_pred))
-    overlap = np.zeros((n_true, n_pred), dtype=np.float64)
-    for t in range(1, n_true + 1):
-        true_mask = (inst_true == t)
-        for p in range(1, n_pred + 1):
-            pred_mask = (inst_pred == p)
-            overlap[t - 1, p - 1] = np.sum(true_mask & pred_mask)
-    return overlap
+    counts = np.zeros((n_true + 1, n_pred + 1), dtype=np.float64)
+    np.add.at(counts, (inst_true.ravel(), inst_pred.ravel()), 1)
+    return counts[1:, 1:]   # drop background row/col (label 0)
 
 
 def compute_grain_count_error(pred_probs, true_masks):
@@ -366,6 +371,7 @@ for model_name, (preds, trues) in all_predictions.items():
     general_rows.append(row)
 
 general_df = pd.DataFrame(general_rows).set_index("Model")
+general_numeric_df = general_df.astype(float)          # keep numeric copy for plotting
 general_df = general_df.map(lambda v: f"{v:.4f}")
 print(general_df.to_string())
 
@@ -416,6 +422,45 @@ for model_name in all_predictions:
 if SHOW_PLOTS:
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
+
+    # ── Comparison chart — metrics across all models ──────────────
+    # Metrics are grouped by scale so they don't drown each other out:
+    #   • accuracy-style, higher is better, all in [0, 1]
+    #   • bounded error/loss, lower is better, all in [0, 1]
+    #   • magnitude error, lower is better, pixel-scale (tens–hundreds)
+    metric_groups = [
+        ("Accuracy metrics",
+         ["Pixel Accuracy", "Avg IoU", "Avg Dice", "Avg Precision", "Avg Recall"]),
+        ("Bounded error / loss",
+         ["Dice Loss", "Count Penalty", "Grain Count Error",
+          "Oversegmentation", "Undersegmentation"]),
+        ("Magnitude error, pixel-scale",
+         ["Mean Grain Area Error", "Wasserstein Grain Size Dist"]),
+    ]
+    metric_groups = [
+        (title, [m for m in cols if m in general_numeric_df.columns])
+        for title, cols in metric_groups
+    ]
+    metric_groups = [(t, c) for t, c in metric_groups if c]
+
+    fig_c, axes_c = plt.subplots(1, len(metric_groups),
+                                 figsize=(6 * len(metric_groups), 6))
+    if len(metric_groups) == 1:
+        axes_c = [axes_c]
+    for ax_c, (title, metrics) in zip(axes_c, metric_groups):
+        general_numeric_df[metrics].T.plot(kind="bar", ax=ax_c)
+        ax_c.set_title(title)
+        ax_c.set_xlabel("Metric")
+        ax_c.set_ylabel("Value")
+        ax_c.tick_params(axis="x", rotation=30)
+        ax_c.legend(title="Model")
+        ax_c.grid(axis="y", alpha=0.3)
+    plt.suptitle("Model comparison — " + ", ".join(general_numeric_df.index))
+    plt.tight_layout()
+    comparison_path = output_dir / "model_comparison_chart.png"
+    plt.savefig(comparison_path, dpi=150)
+    print(f"\n  Saved comparison chart: {comparison_path}")
+    plt.show()
 
     cmap = ListedColormap(['black', 'steelblue', 'orange'])
     n_models = len(MODELS)
