@@ -26,16 +26,16 @@ from create_synthetic_images import load_image_mask_pairs
 #   model_family options: "unet", "unet_modified", "resnext"
 MODELS = [
     ("iter_208", "./models/synthetic_blackbox_iter_208.keras", "unet"),
-    ("modelep30lr3", "./models/modelep30lr3.keras", "unet"),
-    ("iter_293", "./models/synthetic_blackbox_iter_293.keras", "unet"),
-    ("no_rock","./models/seg_model_alumina_only.keras", "unet"),
     ("blackbox_clean","./models/clean_blackbox.keras", "unet"),
+    ("SAM_Annotated_Clean", "./models/seg_model_alumina_sam_annotated.keras", "unet"),
+    ("SAM_Annotated_Degraded", "./models/seg_model_alumina_sam_degraded_jul7.keras", "unet"),
 ]
 
-IMAGE_DIR = "./test_05"
+IMAGE_DIR = "./real_noisy_images"
 PATCH_DIR = "./model_comparison_workspace"
 OUTPUT_DIR = "./model_comparison_metrics"   # where per-model CSV files are saved
 SHOW_PLOTS = True
+MAX_PANEL_COLS = 3       # overview figure wraps to a new row past this many panels
 
 NUM_CLASSES = 3          # 0 = background, 1 = grain, 2 = boundary
 CLASS_LABELS = [0, 1, 2]
@@ -472,7 +472,13 @@ if SHOW_PLOTS:
         true = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         img_stem = Path(img_path).stem
 
-        fig, axes = plt.subplots(1, 2 + n_models, figsize=(6 * (2 + n_models), 5))
+        n_panels = 2 + n_models
+        ncols = min(MAX_PANEL_COLS, n_panels)
+        nrows = int(np.ceil(n_panels / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows),
+                                 squeeze=False)
+        axes = axes.ravel()
+
         axes[0].imshow(img)
         axes[0].set_title("Input image")
         axes[0].axis("off")
@@ -488,6 +494,9 @@ if SHOW_PLOTS:
             axes[2 + j].imshow(pred_label, cmap=cmap, vmin=0, vmax=2, alpha=0.4)
             axes[2 + j].set_title(f"Overlay — {model_name}")
             axes[2 + j].axis("off")
+
+        for ax in axes[n_panels:]:
+            ax.axis("off")
 
         plt.suptitle(f"Image {i}")
         plt.tight_layout()
