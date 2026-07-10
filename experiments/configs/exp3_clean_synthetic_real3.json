@@ -1,0 +1,26 @@
+{
+  "name": "exp3_clean_synthetic_real3",
+  "description": "Train on clean pairs, synthetic BO-noised pairs, and three real non-clean pairs.",
+  "run_dir": "runs/exp3_clean_synthetic_real3",
+  "clean_dir": "surrogate_data/clean_images",
+  "reference_noisy_dir": "surrogate_data/reference_noisy_images",
+  "eval_dir": "surrogate_data/annotated_eval_images",
+  "fit_noise": true,
+  "generate_synthetic": true,
+  "use_synthetic": true,
+  "real_noisy_dir": "surrogate_data/reference_noisy_images",
+  "augmentation": true,
+  "pretrained_model": "models/seg_model.keras",
+  "model_type": "unet",
+  "epochs": 50,
+  "learning_rate": 0.0001,
+  "use_reduce_lr": true,
+  "fit_noise_options": {
+    "maxiter": 20,
+    "popsize": 10,
+    "seed": 2,
+    "max_images": null,
+    "polish": true
+  }
+}
+

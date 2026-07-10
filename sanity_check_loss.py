@@ -24,7 +24,8 @@ MODEL_PATH = "./models/clean_blackbox.keras"  # <-- set this
 #   Must contain paired image/mask files using the same convention as
 #   load_image_mask_pairs: masks have "_mask" in the filename,
 #   images do not.  PNG, JPG, or TIFF.
-#IMAGE_DIR = "./prediction_noisy_images/"  # <-- set this
+# IMAGE_DIR = "./prediction_noisy_images/"  # <-- set this
+# IMAGE_DIR = "./surrogate_data/annotated_eval_images/"  # <-- set this
 IMAGE_DIR = "./real_clean_images/"
 
 # Temporary workspace (will be created/deleted each run).

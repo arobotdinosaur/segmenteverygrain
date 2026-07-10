@@ -43,9 +43,9 @@ def load_image(path: str) -> np.ndarray:
 
 def generate_synthetic_images(
     theta=None,
-    input_folder="./cleanimages/",
+    input_folder="./surrogate_data/clean_images/",
     output_folder="./noisy_output/",
-    noise_reference_folder="./testnoisyimages/",
+    noise_reference_folder="./surrogate_data/reference_noisy_images/",
     seed=42,
 ):
     if theta is None:

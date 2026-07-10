@@ -254,8 +254,8 @@ def invert_percentile_normalize(img_norm: np.ndarray, p_lo: float, p_hi: float):
     return img_norm * (p_hi - p_lo) + p_lo
 
 if __name__ == "__main__":
-    clear_folder = "./testcleanimages/"
-    real_folder = "./testnoisyimages/"
+    clear_folder = "./surrogate_data/clean_images/"
+    real_folder = "./surrogate_data/reference_noisy_images/"
 
     print(f"Loading images from {clear_folder}...")
     clear_imgs, _ = load_images_from_folder(clear_folder)

@@ -32,9 +32,9 @@ import torchvision.transforms.functional as TF
 from keras.optimizers import Adam
 from segmenteverygrain.resnext_model import MaskingResNeXt, weighted_crossentropy_torch
 
-TARGET_PATH = "./real_noisy_images/"
-CLEAN_PATH = "./real_clean_images/"
-PREDICT_PATH = "./prediction_noisy_images/"
+TARGET_PATH = "./surrogate_data/reference_noisy_images/"
+CLEAN_PATH = "./surrogate_data/clean_images/"
+PREDICT_PATH = "./surrogate_data/annotated_eval_images/"
 
 
 # Workspace helper: recreate a directory from scratch for each run.
@@ -179,7 +179,15 @@ def train_model_on_resolutions(
     workspace = Path(workspace)
     patch_dir = reset_dir(workspace / "patches")
 
-    syn_image_dir, syn_mask_dir = seg.patchify_training_data(str(synthetic_folder), Path(patch_dir) / "synthetic")
+    # patchify_training_data expects string folder paths it can glob against.
+    synthetic_folder = str(synthetic_folder)
+    real_noisy_folder = str(real_noisy_folder)
+    if not synthetic_folder.endswith("/"):
+        synthetic_folder = f"{synthetic_folder}/"
+    if not real_noisy_folder.endswith("/"):
+        real_noisy_folder = f"{real_noisy_folder}/"
+
+    syn_image_dir, syn_mask_dir = seg.patchify_training_data(synthetic_folder, Path(patch_dir) / "synthetic")
     real_image_dir, real_mask_dir = seg.patchify_training_data(real_noisy_folder, Path(patch_dir) / "real")
 
     syn_images = sorted(glob(syn_image_dir + "/*.png"))
@@ -445,7 +453,7 @@ def black_box(
 
     # 2) Train the chosen model family on synthetic patches and evaluate on real data.
     model, metrics = train_model_on_resolutions(
-        synthetic_folder = training_folder,
+        synthetic_folder=training_folder,
         real_noisy_folder=TARGET_PATH,
         model_name=f"synthetic_blackbox_{tag}",
         workspace=workspace,

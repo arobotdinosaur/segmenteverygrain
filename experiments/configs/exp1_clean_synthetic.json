@@ -1,0 +1,26 @@
+{
+  "name": "exp1_clean_synthetic",
+  "description": "Train on clean image/mask pairs plus synthetic BO-noised versions of clean pairs.",
+  "run_dir": "runs/exp1_clean_synthetic",
+  "clean_dir": "surrogate_data/clean_images",
+  "reference_noisy_dir": "surrogate_data/reference_noisy_images",
+  "eval_dir": "surrogate_data/annotated_eval_images",
+  "fit_noise": true,
+  "generate_synthetic": true,
+  "use_synthetic": true,
+  "real_noisy_dir": null,
+  "augmentation": true,
+  "pretrained_model": "models/seg_model.keras",
+  "model_type": "unet",
+  "epochs": 50,
+  "learning_rate": 0.0001,
+  "use_reduce_lr": true,
+  "fit_noise_options": {
+    "maxiter": 20,
+    "popsize": 10,
+    "seed": 2,
+    "max_images": null,
+    "polish": true
+  }
+}
+

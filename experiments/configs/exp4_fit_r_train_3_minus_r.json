@@ -1,0 +1,27 @@
+{
+  "name": "exp4_fit_r_train_3_minus_r",
+  "description": "Template for fitting theta on r non-clean images and training with the remaining 3-r real non-clean images plus synthetic data.",
+  "run_dir": "runs/exp4_fit_r_train_3_minus_r",
+  "clean_dir": "surrogate_data/clean_images",
+  "reference_noisy_dir": "surrogate_data/reference_noisy_images",
+  "eval_dir": "surrogate_data/annotated_eval_images",
+  "fit_noise": true,
+  "generate_synthetic": true,
+  "use_synthetic": true,
+  "real_noisy_dir": "surrogate_data/reference_noisy_images",
+  "r_note": "For a strict r / 3-r experiment, create two folders first: one for theta fitting and one for real-noisy training, then set reference_noisy_dir and real_noisy_dir separately.",
+  "augmentation": true,
+  "pretrained_model": "models/seg_model.keras",
+  "model_type": "unet",
+  "epochs": 50,
+  "learning_rate": 0.0001,
+  "use_reduce_lr": true,
+  "fit_noise_options": {
+    "maxiter": 20,
+    "popsize": 10,
+    "seed": 2,
+    "max_images": null,
+    "polish": true
+  }
+}
+

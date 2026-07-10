@@ -16,7 +16,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/zsylvester/segmenteverygrain",
-    packages=['segmenteverygrain'],
+    packages=setuptools.find_packages(),
     install_requires=['numpy','matplotlib',
         'scipy','pillow','scikit-image','tqdm','opencv-python',
         'networkx','rasterio','shapely','tensorflow','segment-anything'],
