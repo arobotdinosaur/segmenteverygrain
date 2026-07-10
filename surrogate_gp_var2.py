@@ -194,6 +194,22 @@ class PatchDataset(Dataset):
         return img_t, mask_t
 
 
+# Apply synthetic noise to an existing TF dataset of (image, mask) pairs.
+def add_synthetic_noise(dataset, noise_params):
+    """Wrap a TF dataset so synthetic noise is applied to each image."""
+    def _apply_noise(img, mask):
+        gray = img[..., 0]
+        noisy = tf.py_function(
+            lambda x: synthetic_noise_model_input(x, noise_params, np.random.default_rng()),
+            [gray],
+            tf.float32,
+        )
+        noisy.set_shape((256, 256))
+        noisy = tf.stack([noisy, noisy, noisy], axis=-1)
+        return noisy, mask
+    return dataset.map(_apply_noise, num_parallel_calls=tf.data.AUTOTUNE)
+
+
 # TensorFlow dataset builder for online synthetic noise.
 def build_synthetic_noise_dataset(image_files, mask_files, params, n_variants=8, seed=None, batch_size=None):
     """Build a TF dataset that applies synthetic noise on-the-fly to clean patches.
@@ -325,7 +341,7 @@ def evaluate_torch_model(model, dataloader, device):
 def train_model_on_resolutions(
     synthetic_folder,
     real_noisy_folder=TARGET_PATH,
-    model_name="synthetic_blackbox",
+    model_name="synthetic_blackbox_var2",
     scales=(0.5, 0.75, 1.0),
     workspace="./blackbox_workspace",
     model_family="unet",
@@ -437,7 +453,7 @@ def train_model_on_resolutions(
             clean_region_pairs = [
                 {**p, "crop_view_id": i}
                 for p in clean_region_pairs
-                for i in range(n_crop_views)
+                for i in range(16)
             ]
         n_train_clean = sum(1 for p in clean_region_pairs if p["split"] == "train")
         n_val_clean = sum(1 for p in clean_region_pairs if p["split"] == "val")
@@ -449,28 +465,27 @@ def train_model_on_resolutions(
         # Keras path: either start from the repo constructors or fine-tune a saved model.
         print("Using Unet")
 
-        if noise_params is not None:
-            syn_train_ds = build_synthetic_noise_dataset(
-                train_syn_images, train_syn_masks, noise_params, seed=None, batch_size=None,
-            )
-            syn_val_ds = build_synthetic_noise_dataset(
-                val_syn_images, val_syn_masks, noise_params, seed=42, batch_size=None,
-            )
-            if combine_with_clean:
-                clean_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
-                syn_train_ds = syn_train_ds.concatenate(clean_train_ds)
-                clean_val_ds = build_dataset(val_syn_images, val_syn_masks, augmentation=False, batch_size=None)
-                syn_val_ds = syn_val_ds.concatenate(clean_train_ds)
-        else:
-            syn_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
-            syn_val_ds = build_dataset(val_syn_images, val_syn_masks, augmentation=False, batch_size=None)
+        syn_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
+        syn_val_ds = build_dataset(val_syn_images, val_syn_masks, augmentation=False, batch_size=None)
+    
+        rng = np.random.default_rng(42)
+        perm = rng.permutation(len(pairs_with_regions))
+        half = len(perm) // 2
 
-        real_train_ds = build_real_noisy_dataset(pairs_with_regions, "train", augment=augment_clean, batch_size=None)
-        real_val_ds = build_real_noisy_dataset(pairs_with_regions, "val", augment=False, batch_size=None)
+        real_pairs_subset = [pairs_with_regions[i] for i in perm[:half]]
+        layer_pairs_subset = [pairs_with_regions[i] for i in perm[half:]]
+
+        real_train_ds = build_real_noisy_dataset(real_pairs_subset, "train", augment=augment_clean, batch_size=None)
+        real_val_ds = build_real_noisy_dataset(real_pairs_subset, "val", augment=False, batch_size=None)
+        layer_train_ds = build_real_noisy_dataset(layer_pairs_subset, "train", augment=augment_clean, batch_size=None)
+        layer_val_ds = build_real_noisy_dataset(layer_pairs_subset, "val", augment=False, batch_size=None)
+
+        if noise_params is not None:
+            layer_train_ds = add_synthetic_noise(layer_train_ds, noise_params)
 
         # Build training streams: synthetic + (optional clean) + (optional real noisy).
-        streams_train = [syn_train_ds,real_train_ds]
-        streams_val = [syn_val_ds,real_val_ds]
+        streams_train = [syn_train_ds,real_train_ds,layer_train_ds]
+        streams_val = [syn_val_ds,real_val_ds,layer_val_ds]
         if augment_clean:
             clean_train_ds = build_real_noisy_dataset(clean_region_pairs, "train", augment=True, batch_size=None)
             clean_val_ds = build_real_noisy_dataset(clean_region_pairs, "val", augment=False, batch_size=None)
@@ -696,7 +711,7 @@ def black_box(
     model, metrics = train_model_on_resolutions(
         synthetic_folder = synthetic_folder,
         real_noisy_folder=TARGET_PATH,
-        model_name=f"synthetic_blackbox_{tag}",
+        model_name=f"synthetic_blackbox_var2_{tag}",
         workspace=workspace,
         model_family=model_family,
         model_weights_file=model_weights_file,
@@ -754,7 +769,7 @@ bounds = np.array([
 n_dim = bounds.shape[0]
 lb, ub = bounds[:, 0], bounds[:, 1]
 
-DATA_PATH = "gp_data.json"
+DATA_PATH = "gp_data_var2.json"
 MAX_KEPT_MODELS = 5
 
 
