@@ -36,7 +36,7 @@ from keras.layers import concatenate
 from keras.utils import load_img
 from keras.saving import load_model
 from keras.optimizers import Adam
-from keras.callbacks import ReduceLROnPlateau
+from keras.callbacks import ReduceLROnPlateau, EarlyStopping
 
 from segment_anything import SamPredictor
 
@@ -2653,7 +2653,7 @@ def create_and_train_model(
     else:
         model = Unet()
         model.compile(
-            optimizer=Adam(), loss=weighted_crossentropy, metrics=["accuracy"]
+            optimizer=Adam(), loss=weighted_crossentropy, metrics=["accuracy",dice_loss]
         )
     history = model.fit(train_dataset, epochs=epochs, validation_data=val_dataset)
     fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 5))
@@ -2711,6 +2711,8 @@ def create_and_train_model_from_pretrained(
     show_plot=True,
     use_reduce_lr=False,
     loss="weighted_crossentropy",
+    use_early_stopping=True,
+    early_stopping_patience=30,
 ):
     """
     Load a pretrained model and fine-tune it on new training data.
@@ -2743,6 +2745,10 @@ def create_and_train_model_from_pretrained(
         - A callable loss function ``fn(y_true, y_pred)``.
         - A dict mapping callable loss functions to their weights, e.g.
           ``{weighted_crossentropy: 0.7, my_other_loss: 0.3}``.
+    use_early_stopping : bool, optional
+        Whether to use EarlyStopping callback (default is False).
+    early_stopping_patience : int, optional
+        Patience for EarlyStopping (default is 10).
 
     Returns
     -------
@@ -2785,7 +2791,7 @@ def create_and_train_model_from_pretrained(
     base_model.compile(
         optimizer=Adam(learning_rate=learning_rate),
         loss=loss_fn,
-        metrics=["accuracy"],
+        metrics=["accuracy",dice_loss],
     )
 
     lrchecks = []
@@ -2793,6 +2799,17 @@ def create_and_train_model_from_pretrained(
     if use_reduce_lr == True:   # your boolean
         reduce_lr = ReduceLROnPlateau(monitor="val_loss",factor=0.5,patience=3,verbose=1,mode="min",min_delta=1e-4,cooldown=1,min_lr=1e-6,)
         lrchecks.append(reduce_lr)
+
+    if use_early_stopping:
+        early_stopping = EarlyStopping(
+            monitor="val_loss",
+            patience=early_stopping_patience,
+            verbose=1,
+            mode="min",
+            restore_best_weights=True,
+            min_delta=1e-4,
+        )
+        lrchecks.append(early_stopping)
 
     history = base_model.fit(train_dataset, epochs=epochs, validation_data=val_dataset,callbacks=lrchecks)
     fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 5))

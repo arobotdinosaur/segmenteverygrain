@@ -11,7 +11,6 @@ import cv2
 import shutil
 import copy
 import random
-import re
 from collections import defaultdict
 from pathlib import Path
 import segmenteverygrain as seg
@@ -23,12 +22,8 @@ from synthetic_noise import NoiseParams, synthetic_noise_model_input
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from glob import glob
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
-from scipy.stats import qmc
 
 import albumentations as A
-import json
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
@@ -36,6 +31,230 @@ import torchvision.transforms.functional as TF
 from keras.optimizers import Adam
 from segmenteverygrain.resnext_model import MaskingResNeXt, weighted_crossentropy_torch
 
+
+def boundary_gradient_alignment(
+    clean: np.ndarray,
+    noisy: np.ndarray,
+    mask: np.ndarray,
+    boundary_class: int = 2,
+    dilation_size: int = 3,
+    min_clean_gradient: float = 1e-3,
+    eps: float = 1e-8,
+) -> float:
+    clean = clean.astype(np.float32)
+    noisy = noisy.astype(np.float32)
+
+    if clean.max() > 1.0:
+        clean /= 255.0
+    if noisy.max() > 1.0:
+        noisy /= 255.0
+
+    boundary_region = (mask == boundary_class).astype(np.uint8)
+
+    if dilation_size > 1:
+        kernel = np.ones((dilation_size, dilation_size), np.uint8)
+        boundary_region = cv2.dilate(boundary_region, kernel, iterations=1)
+
+    boundary_region = boundary_region.astype(bool)
+
+    clean_gx = cv2.Sobel(clean, cv2.CV_32F, 1, 0, ksize=3)
+    clean_gy = cv2.Sobel(clean, cv2.CV_32F, 0, 1, ksize=3)
+    noisy_gx = cv2.Sobel(noisy, cv2.CV_32F, 1, 0, ksize=3)
+    noisy_gy = cv2.Sobel(noisy, cv2.CV_32F, 0, 1, ksize=3)
+
+    clean_mag = np.hypot(clean_gx, clean_gy)
+    noisy_mag = np.hypot(noisy_gx, noisy_gy)
+
+    valid = boundary_region & (clean_mag >= min_clean_gradient)
+
+    if not np.any(valid):
+        return 0.0
+
+    cosine = (clean_gx * noisy_gx + clean_gy * noisy_gy) / (
+        clean_mag * noisy_mag + eps
+    )
+
+    alignment = (cosine[valid] + 1.0) / 2.0
+    weights = clean_mag[valid]
+
+    return float(np.clip(np.average(alignment, weights=weights), 0.0, 1.0))
+
+
+def _to_binary_mask(mask):
+    if mask.dtype == bool:
+        return mask
+    mask = np.asarray(mask)
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    return (mask > 0).astype(np.uint8)
+
+
+def _sobel_gradients(image):
+    image = image.astype(np.float32)
+    if image.max() > 1.0:
+        image = image / 255.0
+    gx = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy)
+    return gx, gy, mag
+
+
+def false_edge_density(
+    clean_image: np.ndarray,
+    noisy_image: np.ndarray,
+    boundary_mask: np.ndarray,
+    exclusion_radius: int = 3,
+    edge_threshold_percentile: float = 90.0,
+    clean_edge_tolerance: float = 0.5,
+    eps: float = 1e-8,
+) -> float:
+    mask = _to_binary_mask(boundary_mask).astype(np.uint8)
+
+    kernel_size = 2 * exclusion_radius + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+
+    excluded_boundary_region = cv2.dilate(
+        mask,
+        kernel,
+        iterations=1,
+    ).astype(bool)
+
+    non_boundary_region = ~excluded_boundary_region
+
+    _, _, clean_mag = _sobel_gradients(clean_image)
+    _, _, noisy_mag = _sobel_gradients(noisy_image)
+
+    if not np.any(non_boundary_region):
+        return 0.0
+
+    threshold = np.percentile(
+        noisy_mag[non_boundary_region],
+        edge_threshold_percentile,
+    )
+
+    strong_noisy_edges = noisy_mag >= threshold
+    weak_clean_structure = clean_mag < clean_edge_tolerance * threshold
+
+    false_edges = (
+        non_boundary_region
+        & strong_noisy_edges
+        & weak_clean_structure
+    )
+
+    return float(
+        np.sum(false_edges)
+        / (np.sum(non_boundary_region) + eps)
+    )
+
+
+def boundary_contrast_retention(
+    clean_image: np.ndarray,
+    noisy_image: np.ndarray,
+    boundary_mask: np.ndarray,
+    dilation_radius: int = 2,
+    eps: float = 1e-8,
+    clip_score: bool = False,
+) -> float:
+    mask = _to_binary_mask(boundary_mask).astype(np.uint8)
+
+    if dilation_radius > 0:
+        kernel_size = 2 * dilation_radius + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        evaluation_mask = cv2.dilate(mask, kernel, iterations=1).astype(bool)
+    else:
+        evaluation_mask = mask.astype(bool)
+
+    _, _, clean_mag = _sobel_gradients(clean_image)
+    _, _, noisy_mag = _sobel_gradients(noisy_image)
+
+    if not np.any(evaluation_mask):
+        return 0.0
+
+    clean_contrast = float(np.mean(clean_mag[evaluation_mask]))
+    noisy_contrast = float(np.mean(noisy_mag[evaluation_mask]))
+
+    score = noisy_contrast / (clean_contrast + eps)
+
+    if clip_score:
+        score = np.clip(score, 0.0, 1.0)
+
+    return float(score)
+
+
+def precompute_score_stats(region_pairs, noise_params, n_samples=50,
+                           evidence_fns=None):
+    """Pre-compute mean/std scores for each evidence function on every region.
+
+    Runs once before training. Only processes train-split regions.
+
+    Parameters
+    ----------
+    region_pairs:
+        List of dicts with keys img_path, mask_path, x, y, split.
+    noise_params:
+        NoiseParams used to generate synthetic realizations.
+    n_samples:
+        Number of noisy realizations per region for stat estimation.
+    evidence_fns:
+        List of callables with signature
+        (clean, noisy, mask) -> float.  Defaults to
+        [boundary_gradient_alignment].
+
+    Returns
+    -------
+    dict keyed by (img_path, x, y) → list[(mean, std), ...]
+        One (mean, std) tuple per evidence function, in the same order
+        as *evidence_fns*.
+    """
+    if evidence_fns is None:
+        evidence_fns = [boundary_gradient_alignment]
+
+    train_pairs = [p for p in region_pairs if p["split"] == "train"]
+    stats = {}
+    for p in train_pairs:
+        img_path = p["img_path"]
+        mask_path = p["mask_path"]
+        rx, ry = p["x"], p["y"]
+
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).astype(np.uint8)
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE).astype(np.uint8)
+
+        crop_img = img[ry:ry + 384, rx:rx + 384]
+        crop_mask = mask[ry:ry + 384, rx:rx + 384]
+
+        sy = (384 - 256) // 2
+        sx = (384 - 256) // 2
+        clean = crop_img[sy:sy + 256, sx:sx + 256].astype(np.float32) / 255.0
+        mask_cls = crop_mask[sy:sy + 256, sx:sx + 256]
+
+        all_scores = [[] for _ in evidence_fns]
+        rng = np.random.default_rng(0)
+        for _ in range(n_samples):
+            noisy = synthetic_noise_model_input(clean, noise_params, rng)
+            for j, fn in enumerate(evidence_fns):
+                all_scores[j].append(fn(clean, noisy, mask_cls))
+
+        func_stats = []
+        for j in range(len(evidence_fns)):
+            arr = np.array(all_scores[j])
+            func_stats.append((float(arr.mean()), float(arr.std())))
+
+        stats[(img_path, rx, ry)] = func_stats
+
+    return stats
+
+
+COMBINE_WITH_CLEAN = True  # Set True to include pre-injection clean images in training
+AUGMENT_CLEAN = True  # Set True to apply Albumentations spatial augmentation to real clean images
+AUGMENT_NOISY = True  # Set True to apply Albumentations spatial augmentation to real noisy images
+N_SYNTHETIC_VARIANTS = 8  # Number of noisy variants per clean image
+N_CROP_VIEWS = 8  # Replicate each real-noisy crop region for more views per epoch
+
+# Evidence functions used to filter synthetic noise realizations by z-score.
+# Each function has signature (clean, noisy, mask) -> float.
+# A realization is kept only if ALL functions produce scores within their
+# pre-computed [mean - z*std, mean + z*std] bounds.
+EVIDENCE_FNS = [boundary_gradient_alignment]
 
 # Albumentations pipeline for real noisy image augmentation.
 real_noisy_aug = A.Compose([
@@ -195,19 +414,89 @@ class PatchDataset(Dataset):
 
 
 # Apply synthetic noise to an existing TF dataset of (image, mask) pairs.
-def add_synthetic_noise(dataset, noise_params):
-    """Wrap a TF dataset so synthetic noise is applied to each image."""
-    def _apply_noise(img, mask):
+def add_synthetic_noise(dataset, noise_params, score_stats=None,
+                        z_lower=1.5, z_upper=1.5, evidence_fns=None):
+    """Wrap a TF dataset so synthetic noise is applied to each image.
+
+    If *score_stats* is provided (a dict from precompute_score_stats),
+    the dataset must be built with include_meta=True so each element is
+    (img, mask, img_path, rx, ry). Each image gets one noisy realization
+    at a time; if any evidence function's score falls outside
+    [mean - z_lower*std, mean + z_upper*std] the realization is
+    regenerated until all filters pass (AND logic).
+
+    If *score_stats* is None, expects a plain (img, mask) dataset and
+    falls back to a single-pass with no filtering.
+
+    Parameters
+    ----------
+    evidence_fns:
+        List of callables with signature (clean, noisy, mask) -> float.
+        Defaults to [boundary_gradient_alignment].
+    """
+    if evidence_fns is None:
+        evidence_fns = [boundary_gradient_alignment]
+
+    has_meta = score_stats is not None
+
+    def _apply_noise(img, mask, img_path=None, rx=None, ry=None):
         gray = img[..., 0]
-        noisy = tf.py_function(
-            lambda x: synthetic_noise_model_input(x, noise_params, np.random.default_rng()),
-            [gray],
-            tf.float32,
-        )
+        mask_class = tf.argmax(mask, axis=-1)  # (256,256) with values 0,1,2
+
+        def _fn_with_meta(clean, mask_idx, ip, x, y):
+            clean_np = clean.numpy().astype(np.float32)
+            mask_np = mask_idx.numpy().astype(np.uint8)
+            rng = np.random.default_rng()
+
+            noisy = synthetic_noise_model_input(clean_np, noise_params, rng)
+
+            if score_stats is not None:
+                ip_str = ip.numpy().decode() if hasattr(ip, 'numpy') else (ip.decode() if isinstance(ip, bytes) else str(ip))
+                key = (ip_str, int(x.numpy()) if hasattr(x, 'numpy') else int(x),
+                       int(y.numpy()) if hasattr(y, 'numpy') else int(y))
+                if key in score_stats:
+                    func_stats = score_stats[key]
+
+                    while True:
+                        all_pass = True
+                        for j, fn in enumerate(evidence_fns):
+                            mean_s, std_s = func_stats[j]
+                            lo = mean_s - z_lower * std_s
+                            hi = mean_s + z_upper * std_s
+                            s = fn(clean_np, noisy, mask_np)
+                            if not (lo <= s <= hi):
+                                all_pass = False
+                                break
+                        if all_pass:
+                            break
+                        noisy = synthetic_noise_model_input(clean_np, noise_params, rng)
+
+            return noisy
+
+        def _fn_plain(clean, mask_idx):
+            clean_np = clean.numpy().astype(np.float32)
+            rng = np.random.default_rng()
+            return synthetic_noise_model_input(clean_np, noise_params, rng)
+
+        if has_meta:
+            noisy = tf.py_function(_fn_with_meta, [gray, mask_class, img_path, rx, ry], tf.float32)
+        else:
+            noisy = tf.py_function(_fn_plain, [gray, mask_class], tf.float32)
+
         noisy.set_shape((256, 256))
         noisy = tf.stack([noisy, noisy, noisy], axis=-1)
         return noisy, mask
-    return dataset.map(_apply_noise, num_parallel_calls=tf.data.AUTOTUNE)
+
+    if has_meta:
+        def _wrap(img, mask, img_path, rx, ry):
+            noisy, mask = _apply_noise(img, mask, img_path, rx, ry)
+            return noisy, mask
+    else:
+        def _wrap(img, mask):
+            noisy, mask = _apply_noise(img, mask)
+            return noisy, mask
+
+    return dataset.map(_wrap, num_parallel_calls=tf.data.AUTOTUNE)
 
 
 # TensorFlow dataset builder for online synthetic noise.
@@ -268,7 +557,8 @@ def build_dataset(image_files, mask_files, augmentation=False, batch_size=32, sh
 
 
 # TensorFlow dataset builder for region-based real noisy augmentation.
-def build_real_noisy_dataset(pairs, split, augment=True, batch_size=32, shuffle_buffer=1000):
+def build_real_noisy_dataset(pairs, split, augment=True, batch_size=32,
+                             shuffle_buffer=1000, include_meta=False):
     """Build a TF dataset from region-assigned real noisy image pairs.
 
     *pairs* is a list of dicts with keys: img_path, mask_path, x, y, split.
@@ -276,6 +566,10 @@ def build_real_noisy_dataset(pairs, split, augment=True, batch_size=32, shuffle_
 
     If *batch_size* is None, returns an unbatched (element-level) dataset
     suitable for concatenation before batching.
+
+    If *include_meta* is True, each element is a 5-tuple
+    (img, mask, img_path, rx, ry) so downstream wrappers can look up
+    pre-computed stats by region key.
     """
     items = [p for p in pairs if p["split"] == split]
     if not items:
@@ -296,18 +590,25 @@ def build_real_noisy_dataset(pairs, split, augment=True, batch_size=32, shuffle_
         )
         img_np.set_shape((256, 256, 3))
         mask_np.set_shape((256, 256))
+        if include_meta:
+            return img_np, mask_np, img_p, rx, ry
         return img_np, mask_np
 
     dataset = tf.data.Dataset.from_tensor_slices((img_paths, mask_paths, xs, ys))
     dataset = dataset.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
-    # One-hot encode the mask to depth 3 (background / grain / boundary).
-    def _onehot(img, mask):
-        mask = tf.one_hot(tf.cast(mask, tf.int32), depth=3, axis=-1)
-        mask = tf.reshape(mask, (256, 256, 3))
-        return img, mask
-
-    dataset = dataset.map(_onehot, num_parallel_calls=tf.data.AUTOTUNE)
+    if include_meta:
+        def _onehot_meta(img, mask, img_p, rx, ry):
+            mask = tf.one_hot(tf.cast(mask, tf.int32), depth=3, axis=-1)
+            mask = tf.reshape(mask, (256, 256, 3))
+            return img, mask, img_p, rx, ry
+        dataset = dataset.map(_onehot_meta, num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+        def _onehot(img, mask):
+            mask = tf.one_hot(tf.cast(mask, tf.int32), depth=3, axis=-1)
+            mask = tf.reshape(mask, (256, 256, 3))
+            return img, mask
+        dataset = dataset.map(_onehot, num_parallel_calls=tf.data.AUTOTUNE)
 
     if batch_size is not None:
         dataset = dataset.shuffle(shuffle_buffer).batch(batch_size).prefetch(tf.data.AUTOTUNE)
@@ -341,18 +642,18 @@ def evaluate_torch_model(model, dataloader, device):
 def train_model_on_resolutions(
     synthetic_folder,
     real_noisy_folder=TARGET_PATH,
-    model_name="synthetic_blackbox_var2",
+    model_name="layered_augmentation",
     scales=(0.5, 0.75, 1.0),
     workspace="./blackbox_workspace",
     model_family="unet",
     model_weights_file="./models/seg_model.keras",
     use_pretrained=True,
     loss = "weighted_crossentropy",
-    n_crop_views=8,
+    n_crop_views=N_CROP_VIEWS,
     noise_params=None,
-    combine_with_clean=False,
-    augment_clean=False,
-    augment_noisy=True,
+    combine_with_clean=COMBINE_WITH_CLEAN,
+    augment_clean=AUGMENT_CLEAN,
+    augment_noisy=AUGMENT_NOISY,
 ):
     """Train on synthetic multi-res patches and evaluate on held-out real noisy images."""
     workspace = Path(workspace)
@@ -468,32 +769,50 @@ def train_model_on_resolutions(
         syn_train_ds = build_dataset(train_syn_images, train_syn_masks, augmentation=True, batch_size=None)
         syn_val_ds = build_dataset(val_syn_images, val_syn_masks, augmentation=False, batch_size=None)
     
-        """rng = np.random.default_rng(42)
-        perm = rng.permutation(len(pairs_with_regions))
-        half = len(perm) // 2
+        #Splitting augmentation logic
+        rng = np.random.default_rng(42)
+        perm = rng.permutation(len(clean_region_pairs))
 
-        real_pairs_subset = [pairs_with_regions[i] for i in perm[:half]]
-        layer_pairs_subset = [pairs_with_regions[i] for i in perm[half:]]
+        clean_subsets = [
+            [clean_region_pairs[i] for i in subset_indices]
+            for subset_indices in np.array_split(perm, 8)
+        ]
 
-        real_train_ds = build_real_noisy_dataset(real_pairs_subset, "train", augment=augment_clean, batch_size=None)
-        real_val_ds = build_real_noisy_dataset(real_pairs_subset, "val", augment=False, batch_size=None)
-        layer_train_ds = build_real_noisy_dataset(layer_pairs_subset, "train", augment=augment_clean, batch_size=None)
-        layer_val_ds = build_real_noisy_dataset(layer_pairs_subset, "val", augment=False, batch_size=None)"""
+        real_noisy_train_ds = build_real_noisy_dataset(pairs_with_regions, "train", augment=False, batch_size=None)
+        real_noisy_val_ds = build_real_noisy_dataset(pairs_with_regions, "val", augment=False, batch_size=None)
         
-        layer_train_ds = build_real_noisy_dataset(pairs_with_regions, "train", augment=False, batch_size=None)
-        layer_val_ds = build_real_noisy_dataset(pairs_with_regions, "val", augment=False, batch_size=None)
-        
-        if noise_params is not None:
-            layer_train_ds = add_synthetic_noise(layer_train_ds, noise_params)
+        #Add synthetic noise to the real noisy data
+        """if noise_params is not None:
+            real_noisy_train_ds = add_synthetic_noise(real_noisy_train_ds, noise_params)"""
 
         # Build training streams: synthetic + (optional clean) + (optional real noisy).
-        streams_train = [syn_train_ds,layer_train_ds]
-        streams_val = [syn_val_ds,layer_val_ds]
+        record_noise_params = [[0.07652291241426773,0.02034248150131113,0.0498800248343853,4.230016482296793,0.0874570440048911],
+                               [0.0007317985679122529,0.030369003290806544,0.04082591422871262,0.9003738842091749,0.08203474496944271],
+                               [0.14569068912848973,0.024456623033781676,0.0379143819252047,5.879460532352486,0.046381700718777175],
+                               [0.17328192338055962,0.04885113314764954,0.038550162917255555,6.706567984131701,0.009970874388909262],
+                               [0.1410890857134039,0.010530486059497041,0.0005376122902326199,5.289880188407845,0.09547597369878381],
+                               [0.00020340266028383094,0.007967854538489146,0.001486517870161773,5.010807594297073,0.003083440260853602],
+                               [0.15278329586406902,0.048511615197154745,0.0008300255906465081,2.5919338311650932,0.017782477982277174],
+                               [0.05666339970163336,0.049457972663613015,0.02400459899113409,3.614819767927746,0.054692281754324286]]
+        streams_train = [syn_train_ds,real_noisy_train_ds]
+        streams_val = [syn_val_ds,real_noisy_val_ds]
         if augment_clean:
-            clean_train_ds = build_real_noisy_dataset(clean_region_pairs, "train", augment=True, batch_size=None)
-            clean_val_ds = build_real_noisy_dataset(clean_region_pairs, "val", augment=False, batch_size=None)
-            streams_train.append(clean_train_ds)
-            streams_val.append(clean_val_ds)
+            for i in range(len(clean_subsets)):
+                clean_train_ds = build_real_noisy_dataset(
+                    clean_subsets[i], "train", augment=False, batch_size=None, include_meta=True,
+                )
+                clean_val_ds = build_real_noisy_dataset(clean_subsets[i], "val", augment=False, batch_size=None)
+                params_i = NoiseParams(*record_noise_params[i])
+                score_stats_i = precompute_score_stats(
+                    clean_subsets[i], params_i, n_samples=50,
+                    evidence_fns=EVIDENCE_FNS,
+                )
+                clean_train_ds1 = add_synthetic_noise(
+                    clean_train_ds, params_i, score_stats=score_stats_i,
+                    z_lower=0, z_upper=1, evidence_fns=EVIDENCE_FNS,
+                )
+                streams_train.append(clean_train_ds1)
+                streams_val.append(clean_val_ds)
 
         train_dataset = streams_train[0]
         for ds in streams_train[1:]:
@@ -683,11 +1002,11 @@ def black_box(
     dice_weight=1.0,
     count_weight=0.4,
     tag=None,
-    combine_with_clean=True,
-    augment_clean=True,
-    augment_noisy=True,
-    n_synthetic_variants=8,
-    n_crop_views=8,
+    combine_with_clean=COMBINE_WITH_CLEAN,
+    augment_clean=AUGMENT_CLEAN,
+    augment_noisy=AUGMENT_NOISY,
+    n_synthetic_variants=N_SYNTHETIC_VARIANTS,
+    n_crop_views=N_CROP_VIEWS,
 ):
     """Evaluate one candidate theta and return a single scalar score."""
     theta = np.asarray(theta, dtype=float)
@@ -715,7 +1034,7 @@ def black_box(
     model, metrics = train_model_on_resolutions(
         synthetic_folder = synthetic_folder,
         real_noisy_folder=TARGET_PATH,
-        model_name=f"synthetic_blackbox_var2_{tag}",
+        model_name=f"{tag}",
         workspace=workspace,
         model_family=model_family,
         model_weights_file=model_weights_file,
@@ -734,10 +1053,10 @@ def black_box(
         patch_dir=workspace / "eval_patches",
         model_family=model_family,
     )
-    mask_loss = compute_mask_loss(pred_probs, true_masks, dice_weight, count_weight)
+    #mask_loss = compute_mask_loss(pred_probs, true_masks, dice_weight, count_weight)
 
     # 4) Final score: composite mask prediction loss.
-    objective_value = float(mask_loss)
+    objective_value = float(metrics["val_loss"])
 
     summary = {
         "theta": theta.tolist(),
@@ -760,178 +1079,3 @@ def black_box(
         f"val_accuracy={metrics['val_accuracy']:.6f}"
     )
     return summary
-
-
-# Parameter bounds for theta = [a, b, sigma_r, l, k] from synthetic_noise.py differential_evolution bounds
-bounds = np.array([
-    [1e-6, 0.2],    # a
-    [1e-6, 0.05],   # b
-    [1e-6, 0.05],   # sigma_r
-    [0.3, 8.0],     # l
-    [1e-6, 0.1],    # k
-])
-n_dim = bounds.shape[0]
-lb, ub = bounds[:, 0], bounds[:, 1]
-
-DATA_PATH = "gp_data_var2.json"
-MAX_KEPT_MODELS = 5
-
-
-def prune_old_models(records, keep_last=MAX_KEPT_MODELS):
-    if len(records) <= keep_last:
-        return
-    all_paths = [Path(r["metrics"]["model_path"]) for r in records if r.get("metrics", {}).get("model_path")]
-    if len(all_paths) <= keep_last:
-        return
-    for p in all_paths[:-keep_last]:
-        if p.exists():
-            print(f"  Pruning old model: {p}")
-            p.unlink()
-
-def load_gp_data(path):
-    p = Path(path)
-    if p.exists():
-        with open(p) as f:
-            data = json.load(f)
-        if "records" in data:
-            records = data["records"]
-            X = np.array([r["theta"] for r in records])
-            y = np.array([r["objective"] for r in records])
-            print(f"Loaded {len(records)} records from {path}")
-            return records, X, y
-        else:
-            # Backward compat: old format with just X, y keys
-            X = np.array(data["X"])
-            y = np.array(data["y"])
-            print(f"Loaded {X.shape[0]} previous data points from {path} (old format)")
-            return None, X, y
-    return None, None, None
-
-def save_gp_data(path, records):
-    with open(path, "w") as f:
-        json.dump({"records": records}, f, indent=2)
-    prune_old_models(records)
-
-def suggest_next(X_scaled, y, n_test=500, beta=1.96):
-    """Fit a GP surrogate and propose the next theta to evaluate."""
-    gp = GaussianProcessRegressor(kernel=C(1.0) * RBF(length_scale=np.ones(n_dim)), n_restarts_optimizer=10)
-    gp.fit(X_scaled, y)
-
-    sampler = qmc.LatinHypercube(d=n_dim, seed=42)
-    X_test_unit = sampler.random(n=n_test)
-    X_test = qmc.scale(X_test_unit, lb, ub)
-    X_test_scaled = (X_test - lb) / (ub - lb)
-
-    y_pred, sigma = gp.predict(X_test_scaled, return_std=True)
-    # Lower objective is better, so use a lower-confidence-bound style acquisition.
-    acquisition = y_pred - beta * sigma
-    best_idx = np.argmin(acquisition)
-    return gp, X_test[best_idx], y_pred[best_idx], sigma[best_idx]
-
-def run_gp_loop(
-    n_iterations,
-    initial_theta=None,
-    data_path=DATA_PATH,
-    n_test=500,
-    beta=1.96,
-    model_family="unet",
-    model_weights_file="./models/seg_model.keras",
-    use_pretrained=True,
-    combine_with_clean=False,
-    augment_clean=True,
-    augment_noisy=True,
-    n_synthetic_variants=8,
-    n_crop_views=8,
-):
-    """Template Bayesian optimization loop around the expensive black box."""
-    records, X_prev, y_prev = load_gp_data(data_path)
-
-    if X_prev is not None and len(X_prev) > 0:
-        records = records if records is not None else []
-        X_train = X_prev.copy()
-        y_train = y_prev.copy()
-        print(f"Continuing with {len(X_train)} existing data points")
-    else:
-        if initial_theta is None:
-            theta_initial = np.array([0.0023589515117326183, 0.001712502743955444, 0.0006997093027690107, 0.7603779994083678, 0.07404317063233228])
-        else:
-            theta_initial = np.array(initial_theta)
-        print(f"Evaluating initial theta: {theta_initial}")
-        X_train = theta_initial.reshape(1, -1)
-        summary = black_box(
-            theta_initial,
-            model_family=model_family,
-            model_weights_file=model_weights_file,
-            use_pretrained=use_pretrained,
-            tag="init",
-            combine_with_clean=combine_with_clean,
-            augment_clean=augment_clean,
-            augment_noisy=augment_noisy,
-            n_synthetic_variants=n_synthetic_variants,
-            n_crop_views=n_crop_views,
-        )
-        y_train = np.array([summary["objective"]])
-        records = [{"iteration": 0, "tag": "init", **summary}]
-        save_gp_data(data_path, records)
-
-    for i in range(n_iterations):
-        iter_num = len(records)
-        iter_tag = f"iter_{iter_num:03d}"
-        print(f"\n--- Iteration {i+1}/{n_iterations} (total #{iter_num}) ---")
-        print(f"Current dataset size: {len(X_train)}")
-
-        X_scaled = (X_train - lb) / (ub - lb)
-        gp, theta_next, pred_mean, pred_std = suggest_next(X_scaled, y_train, n_test=n_test, beta=beta)
-
-        print(f"GP suggests theta: {theta_next}")
-        print(f"GP prediction: mean={pred_mean:.4f}, std={pred_std:.4f}")
-
-        print("Evaluating black_box(theta_next)...")
-        summary = black_box(
-            theta_next,
-            model_family=model_family,
-            model_weights_file=model_weights_file,
-            use_pretrained=use_pretrained,
-            tag=iter_tag,
-            combine_with_clean=combine_with_clean,
-            augment_clean=augment_clean,
-            augment_noisy=augment_noisy,
-            n_synthetic_variants=n_synthetic_variants,
-            n_crop_views=n_crop_views,
-        )
-        print(f"Result: f(theta) = {summary['objective']:.6f}")
-
-        X_train = np.vstack([X_train, theta_next])
-        y_train = np.append(y_train, summary["objective"])
-        records.append({"iteration": iter_num, "tag": iter_tag, **summary})
-        save_gp_data(data_path, records)
-
-        best_idx = np.argmin(y_train)
-        print(f"Best theta so far (iter {best_idx}): f={y_train[best_idx]:.4f}")
-        print(f"Data saved to {data_path}")
-
-    return X_train, y_train
-
-if __name__ == "__main__":
-    N_ITERATIONS = 100  # Change this to control how many searches to run
-    COMBINE_WITH_CLEAN = True  # Set True to include pre-injection clean images in training
-    AUGMENT_CLEAN = True  # Set True to apply Albumentations spatial augmentation to real clean images
-    AUGMENT_NOISY = True  # Set True to apply Albumentations spatial augmentation to real noisy images
-    N_SYNTHETIC_VARIANTS = 8  # Number of noisy variants per clean image
-    N_CROP_VIEWS = 8  # Replicate each real-noisy crop region for more views per epoch
-
-    X_final, y_final = run_gp_loop(
-        n_iterations=N_ITERATIONS,
-        combine_with_clean=COMBINE_WITH_CLEAN,
-        augment_clean=AUGMENT_CLEAN,
-        augment_noisy=AUGMENT_NOISY,
-        n_synthetic_variants=N_SYNTHETIC_VARIANTS,
-        n_crop_views=N_CROP_VIEWS,
-    )
-
-    print("\n=== Final Results ===")
-    for i in range(len(X_final)):
-        print(f"  [{i}] a={X_final[i,0]:.6f}, b={X_final[i,1]:.6f}, sigma_r={X_final[i,2]:.6f}, l={X_final[i,3]:.4f}, k={X_final[i,4]:.4f} -> f={y_final[i]:.4f}")
-    best = np.argmin(y_final)
-    print(f"\nBest: {X_final[best]} with f={y_final[best]:.4f}")
-

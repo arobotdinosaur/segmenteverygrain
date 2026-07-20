@@ -444,7 +444,7 @@ def train_model_on_resolutions(
         print(f"Clean augmented: {n_train_clean} train regions + {n_val_clean} val regions (from {len(clean_pairs)} images, view_repeat={n_crop_views})")
 
     print(f"Synthetic: {len(train_syn_images)} train, {len(val_syn_images)} val")
-
+#Train and Validation; Here is what I want in each split 
     if model_family in {"unet", "unet_modified"}:
         # Keras path: either start from the repo constructors or fine-tune a saved model.
         print("Using Unet")
