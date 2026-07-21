@@ -829,10 +829,10 @@ def train_model_on_resolutions(
         if augment_clean:
             for i in range(len(clean_subsets)):
                 clean_train_ds = build_real_noisy_dataset(
-                    clean_subsets[i], "train", augment=False, batch_size=None, include_meta=True,
+                    clean_subsets[i], "train", augment=False, batch_size=None, include_meta=False,
                 )
                 clean_val_ds = build_real_noisy_dataset(clean_subsets[i], "val", augment=False, batch_size=None)
-                params_i = NoiseParams(*record_noise_params[i])
+                """params_i = NoiseParams(*record_noise_params[i])
                 score_stats_i = precompute_score_stats(
                     clean_subsets[i], params_i, n_samples=50,
                     evidence_fns=EVIDENCE_FNS,
@@ -840,7 +840,7 @@ def train_model_on_resolutions(
                 clean_train_ds = add_synthetic_noise(
                     clean_train_ds, params_i, score_stats=score_stats_i,
                     z_lower=0, z_upper=1, evidence_fns=EVIDENCE_FNS,
-                )
+                )"""
                 streams_train.append(clean_train_ds)
                 streams_val.append(clean_val_ds)
 

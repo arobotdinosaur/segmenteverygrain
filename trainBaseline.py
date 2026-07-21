@@ -1,9 +1,9 @@
-"""Train multiple iterations of a given theta, each saved as name_N.
+"""Train baseline models (no synthetic noise) for a given theta.
 
 Usage:
-    python train_one.py --name my_experiment --n-runs 5 0.002 0.002 0.001 0.76 0.07
+    python trainBaseline.py --name my_experiment --n-runs 3 0.002 0.002 0.001 0.76 0.07
 
-Trains 5 models with tags my_experiment_0, my_experiment_1, ..., my_experiment_4
+Trains 3 models with tags my_experiment_0, my_experiment_1, my_experiment_2
 for the same theta. Results are collected and summarized.
 """
 import argparse
@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from multiple_noise_model_training import (
+from baseline_model_training import (
     black_box,
     CLEAN_PATH,
     TARGET_PATH,
@@ -23,7 +23,7 @@ from multiple_noise_model_training import (
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train multiple iterations of a given theta."
+        description="Train baseline (no noise) iterations of a given theta."
     )
     parser.add_argument("theta", type=float, nargs=5,
                         help="Five theta values: a b sigma_r l k")
