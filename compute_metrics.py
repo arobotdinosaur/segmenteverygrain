@@ -103,9 +103,15 @@ MODELS = [
 """+[(f"multipleNoise{i}",f"./multipleNoise_{i}.keras","unet") for i in range (10)
 ]"""
 
+MODELS = [
+        ("multipleNoiseHardOneSeed0","./reproduceNoiseTest_0.keras","unet"),
+        ("multipleNoiseHardOneSeed1","./reproduceNoiseTest_1.keras","unet"),
+        ("multipleNoiseHardOneSeed2","./reproduceNoiseTest_2.keras","unet"),
+]
+
 IMAGE_DIRS = ["./withheldNoisyTestImages/confident_style(model_style)/"]
 PATCH_DIR = "./model_comparison_workspace"
-OUTPUT_DIR = "./model_comparison_metricsReproduce6"
+OUTPUT_DIR = "./model_comparison_metricsReproduce5"
 SHOW_COMPARISON_CHART = True
 
 NUM_CLASSES = 3          # 0 = background, 1 = grain, 2 = boundary

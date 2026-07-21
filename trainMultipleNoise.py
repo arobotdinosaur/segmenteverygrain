@@ -6,6 +6,8 @@ Usage:
 Trains 5 models with tags my_experiment_0, my_experiment_1, ..., my_experiment_4
 for the same theta. Results are collected and summarized.
 """
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import argparse
 import json
 import sys

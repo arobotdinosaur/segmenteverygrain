@@ -38,9 +38,6 @@ from keras.saving import load_model
 from keras.optimizers import Adam
 from keras.callbacks import ReduceLROnPlateau, EarlyStopping
 
-from segment_anything import SamPredictor
-
-
 def predict_image_tile(im_tile, model):
     """
     Predicts one image tile using a Unet model.
@@ -1882,6 +1879,44 @@ def load_and_preprocess(image_path, mask_path, augmentations=False):
     return image, mask
 
 
+def _augment_seeded_numpy(image_np, mask_np, seed_val):
+    image_np = image_np.numpy()
+    mask_np = mask_np.numpy()
+    rng = np.random.RandomState(int(seed_val) % (2**32))
+    image_np = np.clip(image_np + rng.uniform(-0.2, 0.2), 0, 1)
+    factor = rng.uniform(0.8, 1.2)
+    mean = image_np.mean()
+    image_np = np.clip((image_np - mean) * factor + mean, 0, 1)
+    if rng.random() < 0.5:
+        image_np = np.flip(image_np, axis=1).copy()
+        mask_np = np.flip(mask_np, axis=1).copy()
+    if rng.random() < 0.5:
+        image_np = np.flip(image_np, axis=0).copy()
+        mask_np = np.flip(mask_np, axis=0).copy()
+    return image_np.astype(np.float32), mask_np.astype(np.float32)
+
+
+def load_and_preprocess_seeded(image_path, mask_path, augmentation_seed):
+    """Like load_and_preprocess but always applies deterministic seeded augmentations."""
+    image = tf.io.read_file(image_path)
+    image = tf.image.decode_png(image, channels=3)
+    mask = tf.io.read_file(mask_path)
+    mask = tf.image.decode_png(mask, channels=1)
+    mask = tf.cast(mask, tf.int32)
+    mask = tf.one_hot(mask, depth=3, axis=-1)
+    mask = tf.reshape(mask, (256, 256, 3))
+    image = tf.cast(image, tf.float32) / 255.0
+    image.set_shape((256, 256, 3))
+
+    seed_val = tf.strings.to_hash_bucket_fast(image_path, num_buckets=2**31) + tf.cast(augmentation_seed, tf.int64)
+    image, mask = tf.py_function(
+        _augment_seeded_numpy, [image, mask, seed_val], [tf.float32, tf.float32]
+    )
+    image.set_shape((256, 256, 3))
+    mask.set_shape((256, 256, 3))
+    return image, mask
+
+
 def onclick(event, ax, coords, image, predictor):
     """
     Run the SAM segmentation based on the prompt that comes from a mouse click event.
@@ -2806,7 +2841,7 @@ def create_and_train_model_from_pretrained(
             patience=early_stopping_patience,
             verbose=1,
             mode="min",
-            restore_best_weights=True,
+            restore_best_weights=False,
             min_delta=1e-4,
         )
         lrchecks.append(early_stopping)

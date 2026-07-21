@@ -13,6 +13,7 @@ import copy
 import random
 import threading
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 import segmenteverygrain as seg
 from create_synthetic_images import (
@@ -21,6 +22,7 @@ from create_synthetic_images import (
 )
 from synthetic_noise import NoiseParams, synthetic_noise_model_input
 import tensorflow as tf
+tf.config.experimental.enable_op_determinism()
 from sklearn.model_selection import train_test_split
 from glob import glob
 
@@ -42,7 +44,7 @@ def _derive_seeds(master_seed):
     global MASTER_SEED, _keras_seed, _shuffle_seed, _noise_seed, _noise_master_rng
     MASTER_SEED = master_seed
     rng = np.random.default_rng(MASTER_SEED)
-    _keras_seed = int(rng.integers(2**63))
+    _keras_seed = int(rng.integers(2**32))
     _shuffle_seed = int(rng.integers(2**63))
     _noise_seed = int(rng.integers(2**63))
     keras.utils.set_random_seed(_keras_seed)
@@ -460,11 +462,11 @@ def add_synthetic_noise(dataset, noise_params, score_stats=None,
 
     has_meta = score_stats is not None
 
-    _rng_cache.clear()
     if has_meta:
         for key in score_stats:
-            element_seed = int(_noise_master_rng.integers(0, 2**63))
-            _rng_cache[key] = np.random.default_rng(element_seed)
+            if key not in _rng_cache:
+                element_seed = int(_noise_master_rng.integers(0, 2**63))
+                _rng_cache[key] = np.random.default_rng(element_seed)
 
     def _apply_noise(img, mask, img_path=None, rx=None, ry=None):
         gray = img[..., 0]
@@ -580,7 +582,14 @@ def build_dataset(image_files, mask_files, augmentation=False, batch_size=32, sh
             tf.Variable([True] * len(image_files), dtype=tf.bool),
         ))
 
-    dataset = dataset.map(seg.load_and_preprocess, num_parallel_calls=1)
+    if augmentation:
+        _seed = _shuffle_seed
+        dataset = dataset.map(
+            lambda img, mask, *a: seg.load_and_preprocess_seeded(img, mask, _seed),
+            num_parallel_calls=1,
+        )
+    else:
+        dataset = dataset.map(seg.load_and_preprocess, num_parallel_calls=1)
     if batch_size is not None:
         dataset = dataset.shuffle(shuffle_buffer, seed=_shuffle_seed).batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return dataset
@@ -625,20 +634,20 @@ def build_real_noisy_dataset(pairs, split, augment=True, batch_size=32,
         return img_np, mask_np
 
     dataset = tf.data.Dataset.from_tensor_slices((img_paths, mask_paths, xs, ys))
-    dataset = dataset.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.map(_map_fn, num_parallel_calls=1)
 
     if include_meta:
         def _onehot_meta(img, mask, img_p, rx, ry):
             mask = tf.one_hot(tf.cast(mask, tf.int32), depth=3, axis=-1)
             mask = tf.reshape(mask, (256, 256, 3))
             return img, mask, img_p, rx, ry
-        dataset = dataset.map(_onehot_meta, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(_onehot_meta, num_parallel_calls=1)
     else:
         def _onehot(img, mask):
             mask = tf.one_hot(tf.cast(mask, tf.int32), depth=3, axis=-1)
             mask = tf.reshape(mask, (256, 256, 3))
             return img, mask
-        dataset = dataset.map(_onehot, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(_onehot, num_parallel_calls=1)
 
     if batch_size is not None:
         dataset = dataset.shuffle(shuffle_buffer, seed=_shuffle_seed).batch(batch_size).prefetch(tf.data.AUTOTUNE)
