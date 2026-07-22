@@ -50,7 +50,7 @@ MODELS = [
     ("wilson_only", "./models/sam3_decoder_wilson_only_ft.pt"),
 ]
 
-IMAGE_DIR = "./real_noisy_images"
+IMAGE_DIR = "./real_clean_images"
 OUTPUT_DIR = "./sam_model_comparison_metrics"
 SHOW_PLOTS = True
 MAX_PANEL_COLS = 3       # overview figure wraps to a new row past this many panels
