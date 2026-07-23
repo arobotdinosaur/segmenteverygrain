@@ -14,6 +14,7 @@ import random
 import re
 from collections import defaultdict
 from pathlib import Path
+from skimage.measure import label as sk_label
 import segmenteverygrain as seg
 from create_synthetic_images import (
     generate_synthetic_images as generate_synthetic_images_from_script,
@@ -572,15 +573,27 @@ def train_model_on_resolutions(
     }
     return model, metrics
 
+# When True, pixel-level metrics only evaluate on non-background pixels
+# (i.e. within the known mask regions: interior + boundary).
+EVAL_WITHIN_MASK = True
+
 def dice_loss(predicted_probs, true_masks, eps=1e-7):
     """Multi-class Dice loss averaged over images. Lower = more similar."""
     total = 0.0
     for pred, true in zip(predicted_probs, true_masks):
         h, w = min(pred.shape[0], true.shape[0]), min(pred.shape[1], true.shape[1])
         pred, true = pred[:h, :w], true[:h, :w]
-        one_hot = np.eye(pred.shape[-1])[true]
-        intersection = np.sum(pred * one_hot, axis=(0, 1))
-        union = np.sum(pred + one_hot, axis=(0, 1))
+        if EVAL_WITHIN_MASK:
+            known = true != 0
+            if not np.any(known):
+                continue
+            pred_flat = pred.reshape(-1, pred.shape[-1])[known.ravel()]
+            one_hot = np.eye(pred.shape[-1])[true.ravel()][known.ravel()]
+        else:
+            pred_flat = pred.reshape(-1, pred.shape[-1])
+            one_hot = np.eye(pred.shape[-1])[true.ravel()]
+        intersection = np.sum(pred_flat * one_hot, axis=0)
+        union = np.sum(pred_flat + one_hot, axis=0)
         total += float(1 - np.mean((2 * intersection + eps) / (union + eps)))
     return total / max(1, len(predicted_probs))
 
@@ -592,8 +605,8 @@ def count_penalty(predicted_probs, true_masks):
         h, w = min(pred.shape[0], true.shape[0]), min(pred.shape[1], true.shape[1])
         pred_label = np.argmax(pred[:h, :w], axis=-1).astype(np.uint8)
         true_label = true[:h, :w].astype(np.uint8)
-        n_pred = max(cv2.connectedComponents((pred_label == 1).astype(np.uint8))[0] - 1, 0)
-        n_true = max(cv2.connectedComponents((true_label == 1).astype(np.uint8))[0] - 1, 0)
+        n_pred = int(sk_label((pred_label == 1), connectivity=2).max())
+        n_true = int(sk_label((true_label == 1), connectivity=2).max())
         total += abs(n_pred - n_true) / max(n_true, 1)
     return total / max(1, len(predicted_probs))
 

@@ -65,7 +65,7 @@ def main():
 
     summaries = []
     for run_idx in range(args.n_runs):
-        tag = f"{base_name}_{run_idx}"
+        tag = f"{base_name}_seed{run_idx+10}"
         print(f"\n--- Run {run_idx + 1}/{args.n_runs}: {tag} ---")
         summary = black_box(
             theta,
@@ -78,7 +78,7 @@ def main():
             combine_with_clean=args.combine_with_clean,
             n_synthetic_variants=args.n_synthetic_variants,
             n_crop_views=args.n_crop_views,
-            master_seed=args.master_seed,
+            master_seed=run_idx+10, # [10,11,12,13,14,15,16,17,18,19] for 10 runs
         )
         summaries.append(summary)
 

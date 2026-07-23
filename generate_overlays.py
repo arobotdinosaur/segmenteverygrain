@@ -100,10 +100,13 @@ MODELS = [
     #("multipleNoiseHarder1","./multipleNoiseBelowMeanFilter_1.keras","unet"),
     #("multipleNoiseHarder2","./multipleNoiseBelowMeanFilter_2.keras","unet"),
     ]
+MODELS = [(f"seed{i}MultipleNoiseSSIM",f"./seededModels/multipleNoiseSSIMReproducible_seed{i}.keras","unet") for i in range(10,12)]\
++[(f"seed{i}Baseline",f"./seededModels/baselineReproducible_seed{i}.keras","unet") for i in range(10,12)]\
++[(f"seed{i}MultipleNoise",f"./seededModels/multipleNoiseNotSharedReproducible_seed{i}.keras","unet") for i in range(10,12)]
 
-IMAGE_DIRS = ["./withheldNoisyTestImages/confident_style(model_style)/"]
+IMAGE_DIRS = ["./cleanedWithheld/"]#"./withheldNoisyTestImages/confident_style(model_style)/"]
 PATCH_DIR = "./overlay_workspace"
-OUTPUT_DIR = "./overlaysOnlyNoiseValidationSyntheticSeg3"
+OUTPUT_DIR = "./overlaysOnlyNoiseValidationSyntheticSeg4"
 SHOW_PLOTS = True
 
 # ═══════════════════════════════════════════════════════════════════

@@ -205,8 +205,8 @@ def boundary_contrast_retention(
 
 
 def precompute_score_stats(region_pairs, noise_params, n_samples=50,
-                           evidence_fns=None):
-    """Pre-compute mean/std scores for each evidence function on every region.
+                           evidence_fns=None, quantile_bounds=None):
+    """Pre-compute score statistics for each evidence function on every region.
 
     Runs once before training. Only processes train-split regions.
 
@@ -222,12 +222,19 @@ def precompute_score_stats(region_pairs, noise_params, n_samples=50,
         List of callables with signature
         (clean, noisy, mask) -> float.  Defaults to
         [boundary_gradient_alignment].
+    quantile_bounds:
+        Optional list with one entry per evidence function.
+        Each entry is either a (lo, hi) tuple of quantile bounds
+        (e.g. (0.05, 0.95)) to enable quantile-based filtering for
+        that function, or None to use z-score filtering instead.
+        Example: [(0.023, 0.159), None] uses quantile for the first
+        function and z-score for the second.
 
     Returns
     -------
-    dict keyed by (img_path, x, y) → list[(mean, std), ...]
-        One (mean, std) tuple per evidence function, in the same order
-        as *evidence_fns*.
+    dict keyed by (img_path, x, y) -> list of dicts, one per evidence
+        function.  Each dict has keys 'mean', 'std', and optionally
+        'q_lo', 'q_hi' (only when that function has quantile_bounds).
     """
     if evidence_fns is None:
         evidence_fns = [boundary_gradient_alignment]
@@ -260,7 +267,12 @@ def precompute_score_stats(region_pairs, noise_params, n_samples=50,
         func_stats = []
         for j in range(len(evidence_fns)):
             arr = np.array(all_scores[j])
-            func_stats.append((float(arr.mean()), float(arr.std())))
+            entry = {"mean": float(arr.mean()), "std": float(arr.std())}
+            if quantile_bounds is not None and quantile_bounds[j] is not None:
+                lo_q, hi_q = quantile_bounds[j]
+                entry["q_lo"] = float(np.percentile(arr, lo_q * 100))
+                entry["q_hi"] = float(np.percentile(arr, hi_q * 100))
+            func_stats.append(entry)
 
         stats[(img_path, rx, ry)] = func_stats
 
@@ -438,27 +450,51 @@ class PatchDataset(Dataset):
 
 # Apply synthetic noise to an existing TF dataset of (image, mask) pairs.
 def add_synthetic_noise(dataset, noise_params, score_stats=None,
-                        z_lower=1.5, z_upper=1.5, evidence_fns=None):
+                        z_lower=1.5, z_upper=1.5, evidence_fns=None,
+                        quantile_bounds=None):
     """Wrap a TF dataset so synthetic noise is applied to each image.
 
     If *score_stats* is provided (a dict from precompute_score_stats),
     the dataset must be built with include_meta=True so each element is
     (img, mask, img_path, rx, ry). Each image gets one noisy realization
-    at a time; if any evidence function's score falls outside
-    [mean - z_lower*std, mean + z_upper*std] the realization is
-    regenerated until all filters pass (AND logic).
+    at a time; if any evidence function's score falls outside the
+    accepted range the realization is regenerated until all filters
+    pass (AND logic).
+
+    Filtering is per-function:
+      - If quantile_bounds[j] is not None and the precomputed entry
+        has 'q_lo'/'q_hi', quantile-based filtering is used for that
+        function: reject if score outside [q_lo, q_hi].
+      - Otherwise, z-score filtering is used for that function:
+        reject if score outside [mean - z_lower[j]*std, mean + z_upper[j]*std].
 
     If *score_stats* is None, expects a plain (img, mask) dataset and
     falls back to a single-pass with no filtering.
 
     Parameters
     ----------
+    z_lower, z_upper:
+        Scalar or list/tuple with one entry per evidence function.
+        A scalar is broadcast to all functions.
+        Used only for functions where quantile_bounds[j] is None.
+    quantile_bounds:
+        Optional list with one entry per evidence function.
+        Each entry is either a (lo, hi) tuple to enable quantile-based
+        filtering, or None to use z-score filtering instead.
     evidence_fns:
         List of callables with signature (clean, noisy, mask) -> float.
         Defaults to [boundary_gradient_alignment].
     """
     if evidence_fns is None:
         evidence_fns = [boundary_gradient_alignment]
+
+    n_fns = len(evidence_fns)
+    if np.isscalar(z_lower):
+        z_lower = [z_lower] * n_fns
+    if np.isscalar(z_upper):
+        z_upper = [z_upper] * n_fns
+    if quantile_bounds is None:
+        quantile_bounds = [None] * n_fns
 
     has_meta = score_stats is not None
 
@@ -492,9 +528,21 @@ def add_synthetic_noise(dataset, noise_params, score_stats=None,
                     while True:
                         all_pass = True
                         for j, fn in enumerate(evidence_fns):
-                            mean_s, std_s = func_stats[j]
-                            lo = mean_s - z_lower * std_s
-                            hi = mean_s + z_upper * std_s
+                            entry = func_stats[j]
+                            use_q = (quantile_bounds[j] is not None
+                                     and "q_lo" in entry)
+                            if use_q:
+                                lo = entry["q_lo"]
+                                hi = entry["q_hi"]
+                            elif isinstance(entry, dict):
+                                mean_s = entry["mean"]
+                                std_s = entry["std"]
+                                lo = mean_s - z_lower[j] * std_s
+                                hi = mean_s + z_upper[j] * std_s
+                            else:
+                                mean_s, std_s = entry
+                                lo = mean_s - z_lower[j] * std_s
+                                hi = mean_s + z_upper[j] * std_s
                             s = fn(clean_np, noisy, mask_np)
                             if not (lo <= s <= hi):
                                 all_pass = False

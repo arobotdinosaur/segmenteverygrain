@@ -8,6 +8,7 @@ The GP loop then uses those scores to suggest the next theta to try.
 
 import numpy as np
 import cv2
+from skimage.metrics import structural_similarity
 import shutil
 import copy
 import random
@@ -101,6 +102,284 @@ def boundary_gradient_alignment(
     weights = clean_mag[valid]
 
     return float(np.clip(np.average(alignment, weights=weights), 0.0, 1.0))
+
+def boundary_gradient_magnitude_preservation(
+    clean: np.ndarray,
+    noisy: np.ndarray,
+    mask: np.ndarray,
+    boundary_class: int = 2,
+    dilation_size: int = 3,
+    min_clean_gradient: float = 1e-3,
+    alpha: float = 3.0,
+    eps: float = 1e-8,
+) -> float:
+    """Per-pixel gradient magnitude preservation at boundary regions.
+
+    Computes the ratio of noisy to clean gradient magnitudes at each
+    valid boundary pixel, then applies an exponential decay on the
+    log-ratio to produce a per-pixel preservation score in [0, 1].
+    Final score is the mean across valid pixels.
+
+    Parameters
+    ----------
+    alpha : float
+        Sharpness of the decay.  Higher values penalise large magnitude
+        ratios more harshly.  Default 3.0 gives score ~0.1 at a 2x ratio.
+    """
+    clean = clean.astype(np.float32)
+    noisy = noisy.astype(np.float32)
+
+    if clean.max() > 1.0:
+        clean /= 255.0
+    if noisy.max() > 1.0:
+        noisy /= 255.0
+
+    boundary_region = (mask == boundary_class).astype(np.uint8)
+
+    if dilation_size > 1:
+        kernel = np.ones((dilation_size, dilation_size), np.uint8)
+        boundary_region = cv2.dilate(boundary_region, kernel, iterations=1)
+
+    boundary_region = boundary_region.astype(bool)
+
+    clean_gx = cv2.Sobel(clean, cv2.CV_32F, 1, 0, ksize=3)
+    clean_gy = cv2.Sobel(clean, cv2.CV_32F, 0, 1, ksize=3)
+    noisy_gx = cv2.Sobel(noisy, cv2.CV_32F, 1, 0, ksize=3)
+    noisy_gy = cv2.Sobel(noisy, cv2.CV_32F, 0, 1, ksize=3)
+
+    clean_mag = np.hypot(clean_gx, clean_gy)
+    noisy_mag = np.hypot(noisy_gx, noisy_gy)
+
+    valid = boundary_region & (clean_mag >= min_clean_gradient)
+
+    if not np.any(valid):
+        return 0.0
+
+    ratio = (noisy_mag[valid] + eps) / (clean_mag[valid] + eps)
+    score = np.exp(-alpha * np.abs(np.log(ratio)))
+
+    return float(np.mean(score))
+
+def soft_false_boundary_score(
+    clean: np.ndarray,
+    noisy: np.ndarray,
+    mask: np.ndarray,
+    boundary_class: int = 2,
+    dilation_size: int = 5,
+    boundary_percentile: float = 50.0,
+    temperature: float = 0.05,
+    eps: float = 1e-8,
+) -> float:
+    clean = np.asarray(clean, dtype=np.float32).squeeze()
+    noisy = np.asarray(noisy, dtype=np.float32).squeeze()
+    mask = np.asarray(mask).squeeze()
+
+    if clean.shape != noisy.shape or clean.shape != mask.shape:
+        raise ValueError("clean, noisy, and mask must have matching shapes.")
+
+    # Prefer enforcing [0, 1] before calling this function.
+    if max(float(clean.max()), float(noisy.max())) > 2.0:
+        clean /= 255.0
+        noisy /= 255.0
+
+    clean = np.clip(clean, 0.0, 1.0)
+    noisy = np.clip(noisy, 0.0, 1.0)
+
+    boundary_region = (mask == boundary_class).astype(np.uint8)
+
+    if dilation_size > 1:
+        kernel = np.ones(
+            (dilation_size, dilation_size),
+            dtype=np.uint8,
+        )
+        boundary_region = cv2.dilate(
+            boundary_region,
+            kernel,
+            iterations=1,
+        )
+
+    boundary_region = boundary_region.astype(bool)
+    off_boundary = ~boundary_region
+
+    if not np.any(boundary_region) or not np.any(off_boundary):
+        return 0.0
+
+    def gradient_magnitude(image: np.ndarray) -> np.ndarray:
+        grad_x = cv2.Sobel(
+            image,
+            cv2.CV_32F,
+            1,
+            0,
+            ksize=3,
+        )
+        grad_y = cv2.Sobel(
+            image,
+            cv2.CV_32F,
+            0,
+            1,
+            ksize=3,
+        )
+        return cv2.magnitude(grad_x, grad_y)
+
+    clean_gradient = gradient_magnitude(clean)
+    noisy_gradient = gradient_magnitude(noisy)
+
+    boundary_reference = max(
+        float(
+            np.percentile(
+                clean_gradient[boundary_region],
+                boundary_percentile,
+            )
+        ),
+        eps,
+    )
+
+    scale = max(temperature * boundary_reference, eps)
+
+    clean_boundary_likeness = 1.0 / (
+        1.0
+        + np.exp(
+            -(clean_gradient - boundary_reference) / scale
+        )
+    )
+
+    noisy_boundary_likeness = 1.0 / (
+        1.0
+        + np.exp(
+            -(noisy_gradient - boundary_reference) / scale
+        )
+    )
+
+    increase = np.maximum(
+        noisy_boundary_likeness
+        - clean_boundary_likeness,
+        0.0,
+    )
+
+    return float(np.mean(increase[off_boundary]))
+
+def false_off_boundary_edge_ratio(
+    clean: np.ndarray,
+    noisy: np.ndarray,
+    mask: np.ndarray,
+    boundary_class: int = 2,
+    dilation_size: int = 5,
+    edge_percentile: float = 90.0,
+    eps: float = 1e-8,
+) -> float:
+    clean = np.asarray(clean, dtype=np.float32).squeeze()
+    noisy = np.asarray(noisy, dtype=np.float32).squeeze()
+    mask = np.asarray(mask).squeeze()
+
+    if clean.max() > 1.0:
+        clean = clean / 255.0
+    if noisy.max() > 1.0:
+        noisy = noisy / 255.0
+
+    boundary_region = (mask == boundary_class).astype(np.uint8)
+
+    if dilation_size > 1:
+        kernel = np.ones((dilation_size, dilation_size), dtype=np.uint8)
+        boundary_region = cv2.dilate(boundary_region, kernel, iterations=1)
+
+    off_boundary = boundary_region == 0
+
+    if not np.any(off_boundary):
+        return 0.0
+
+    def gradient_magnitude(image: np.ndarray) -> np.ndarray:
+        grad_x = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=3)
+        return cv2.magnitude(grad_x, grad_y)
+
+    clean_gradient = gradient_magnitude(clean)
+    noisy_gradient = gradient_magnitude(noisy)
+
+    clean_off_gradient = clean_gradient[off_boundary]
+
+    edge_threshold = max(float(np.percentile(clean_off_gradient, edge_percentile)), eps)
+
+    clean_strong = clean_gradient >= edge_threshold
+    noisy_strong = noisy_gradient >= edge_threshold
+
+    new_false_edges = off_boundary & (~clean_strong) & noisy_strong
+
+    eligible_region = off_boundary & (~clean_strong)
+    eligible_count = int(np.count_nonzero(eligible_region))
+
+    if eligible_count == 0:
+        return 0.0
+
+    return float(np.count_nonzero(new_false_edges) / eligible_count)
+
+
+def boundary_ssim(
+    clean: np.ndarray,
+    noisy: np.ndarray,
+    mask: np.ndarray,
+    boundary_class: int = 2,
+    dilation_size: int = 3,
+    win_size: int = 3,
+    gaussian_weights: bool = True,
+) -> float:
+    """Structural similarity at boundary pixels.
+
+    .. warning::
+        This metric produces a bimodal distribution because SSIM at sharp
+        edges is highly sensitive to sub-pixel edge shifts caused by noise.
+        Crops with high-gradient boundaries score near 0; crops with
+        gradual boundaries score near 0.5.  The bimodality correlates with
+        boundary sharpness (a property of the image), not noise quality.
+        Prefer ``boundary_gradient_alignment`` for evidence filtering.
+    """
+    clean = clean.astype(np.float32)
+    noisy = noisy.astype(np.float32)
+
+    if clean.max() > 1.0:
+        clean /= 255.0
+    if noisy.max() > 1.0:
+        noisy /= 255.0
+
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+
+    boundary_region = (mask == boundary_class).astype(np.uint8)
+
+    if dilation_size > 1:
+        kernel = np.ones((dilation_size, dilation_size), dtype=np.uint8)
+        boundary_region = cv2.dilate(boundary_region, kernel, iterations=1)
+
+    boundary_region = boundary_region.astype(bool)
+
+    if not np.any(boundary_region):
+        print("Not valid sadge")
+        return 0.0
+
+    max_win_size = min(clean.shape[:2])
+
+    if max_win_size < 3:
+        return 0.0
+
+    if max_win_size % 2 == 0:
+        max_win_size -= 1
+
+    actual_win_size = min(win_size, max_win_size)
+
+    if actual_win_size % 2 == 0:
+        actual_win_size -= 1
+
+    _, ssim_map = structural_similarity(
+        clean,
+        noisy,
+        data_range=1.0,
+        win_size=actual_win_size,
+        full=True,
+        gaussian_weights=gaussian_weights,
+    )
+
+    boundary_score = np.median(ssim_map[boundary_region])
+
+    return float((boundary_score + 1.0) / 2.0)
 
 
 def _to_binary_mask(mask):
@@ -205,8 +484,8 @@ def boundary_contrast_retention(
 
 
 def precompute_score_stats(region_pairs, noise_params, n_samples=50,
-                           evidence_fns=None):
-    """Pre-compute mean/std scores for each evidence function on every region.
+                           evidence_fns=None, quantile_bounds=None):
+    """Pre-compute score statistics for each evidence function on every region.
 
     Runs once before training. Only processes train-split regions.
 
@@ -222,15 +501,22 @@ def precompute_score_stats(region_pairs, noise_params, n_samples=50,
         List of callables with signature
         (clean, noisy, mask) -> float.  Defaults to
         [boundary_gradient_alignment].
+    quantile_bounds:
+        Optional list with one entry per evidence function.
+        Each entry is either a (lo, hi) tuple of quantile bounds
+        (e.g. (0.05, 0.95)) to enable quantile-based filtering for
+        that function, or None to use z-score filtering instead.
+        Example: [(0.023, 0.159), None] uses quantile for the first
+        function and z-score for the second.
 
     Returns
     -------
-    dict keyed by (img_path, x, y) → list[(mean, std), ...]
-        One (mean, std) tuple per evidence function, in the same order
-        as *evidence_fns*.
+    dict keyed by (img_path, x, y) -> list of dicts, one per evidence
+        function.  Each dict has keys 'mean', 'std', and optionally
+        'q_lo', 'q_hi' (only when that function has quantile_bounds).
     """
     if evidence_fns is None:
-        evidence_fns = [boundary_gradient_alignment]
+        evidence_fns = [boundary_gradient_alignment, false_off_boundary_edge_ratio]
 
     train_pairs = [p for p in region_pairs if p["split"] == "train"]
     stats = {}
@@ -251,7 +537,8 @@ def precompute_score_stats(region_pairs, noise_params, n_samples=50,
         mask_cls = crop_mask[sy:sy + 256, sx:sx + 256]
 
         all_scores = [[] for _ in evidence_fns]
-        rng = np.random.default_rng(_noise_seed)
+        region_seed = int(_noise_master_rng.integers(0, 2**63))
+        rng = np.random.default_rng(region_seed)
         for _ in range(n_samples):
             noisy = synthetic_noise_model_input(clean, noise_params, rng)
             for j, fn in enumerate(evidence_fns):
@@ -260,7 +547,12 @@ def precompute_score_stats(region_pairs, noise_params, n_samples=50,
         func_stats = []
         for j in range(len(evidence_fns)):
             arr = np.array(all_scores[j])
-            func_stats.append((float(arr.mean()), float(arr.std())))
+            entry = {"mean": float(arr.mean()), "std": float(arr.std())}
+            if quantile_bounds is not None and quantile_bounds[j] is not None:
+                lo_q, hi_q = quantile_bounds[j]
+                entry["q_lo"] = float(np.percentile(arr, lo_q * 100))
+                entry["q_hi"] = float(np.percentile(arr, hi_q * 100))
+            func_stats.append(entry)
 
         stats[(img_path, rx, ry)] = func_stats
 
@@ -277,7 +569,7 @@ N_CROP_VIEWS = 8  # Replicate each real-noisy crop region for more views per epo
 # Each function has signature (clean, noisy, mask) -> float.
 # A realization is kept only if ALL functions produce scores within their
 # pre-computed [mean - z*std, mean + z*std] bounds.
-EVIDENCE_FNS = [boundary_gradient_alignment]
+EVIDENCE_FNS = [boundary_gradient_alignment, boundary_gradient_magnitude_preservation]
 
 # Albumentations pipeline for real noisy image augmentation.
 real_noisy_aug = A.Compose([
@@ -438,27 +730,51 @@ class PatchDataset(Dataset):
 
 # Apply synthetic noise to an existing TF dataset of (image, mask) pairs.
 def add_synthetic_noise(dataset, noise_params, score_stats=None,
-                        z_lower=1.5, z_upper=1.5, evidence_fns=None):
+                        z_lower=1.5, z_upper=1.5, evidence_fns=None,
+                        quantile_bounds=None):
     """Wrap a TF dataset so synthetic noise is applied to each image.
 
     If *score_stats* is provided (a dict from precompute_score_stats),
     the dataset must be built with include_meta=True so each element is
     (img, mask, img_path, rx, ry). Each image gets one noisy realization
-    at a time; if any evidence function's score falls outside
-    [mean - z_lower*std, mean + z_upper*std] the realization is
-    regenerated until all filters pass (AND logic).
+    at a time; if any evidence function's score falls outside the
+    accepted range the realization is regenerated until all filters
+    pass (AND logic).
+
+    Filtering is per-function:
+      - If quantile_bounds[j] is not None and the precomputed entry
+        has 'q_lo'/'q_hi', quantile-based filtering is used for that
+        function: reject if score outside [q_lo, q_hi].
+      - Otherwise, z-score filtering is used for that function:
+        reject if score outside [mean - z_lower[j]*std, mean + z_upper[j]*std].
 
     If *score_stats* is None, expects a plain (img, mask) dataset and
     falls back to a single-pass with no filtering.
 
     Parameters
     ----------
+    z_lower, z_upper:
+        Scalar or list/tuple with one entry per evidence function.
+        A scalar is broadcast to all functions.
+        Used only for functions where quantile_bounds[j] is None.
+    quantile_bounds:
+        Optional list with one entry per evidence function.
+        Each entry is either a (lo, hi) tuple to enable quantile-based
+        filtering, or None to use z-score filtering instead.
     evidence_fns:
         List of callables with signature (clean, noisy, mask) -> float.
-        Defaults to [boundary_gradient_alignment].
+        Defaults to [boundary_ssim].
     """
     if evidence_fns is None:
-        evidence_fns = [boundary_gradient_alignment]
+        evidence_fns = [boundary_ssim]
+
+    n_fns = len(evidence_fns)
+    if np.isscalar(z_lower):
+        z_lower = [z_lower] * n_fns
+    if np.isscalar(z_upper):
+        z_upper = [z_upper] * n_fns
+    if quantile_bounds is None:
+        quantile_bounds = [None] * n_fns
 
     has_meta = score_stats is not None
 
@@ -485,16 +801,30 @@ def add_synthetic_noise(dataset, noise_params, score_stats=None,
 
             noisy = synthetic_noise_model_input(clean_np, noise_params, rng)
 
-            if score_stats is not None:
+            has_boundary = np.any(mask_np == 2)
+
+            if score_stats is not None and has_boundary:
                 if key in score_stats:
                     func_stats = score_stats[key]
 
                     while True:
                         all_pass = True
                         for j, fn in enumerate(evidence_fns):
-                            mean_s, std_s = func_stats[j]
-                            lo = mean_s - z_lower * std_s
-                            hi = mean_s + z_upper * std_s
+                            entry = func_stats[j]
+                            use_q = (quantile_bounds[j] is not None
+                                     and "q_lo" in entry)
+                            if use_q:
+                                lo = entry["q_lo"]
+                                hi = entry["q_hi"]
+                            elif isinstance(entry, dict):
+                                mean_s = entry["mean"]
+                                std_s = entry["std"]
+                                lo = mean_s - z_lower[j] * std_s
+                                hi = mean_s + z_upper[j] * std_s
+                            else:
+                                mean_s, std_s = entry
+                                lo = mean_s - z_lower[j] * std_s
+                                hi = mean_s + z_upper[j] * std_s
                             s = fn(clean_np, noisy, mask_np)
                             if not (lo <= s <= hi):
                                 all_pass = False
@@ -845,10 +1175,13 @@ def train_model_on_resolutions(
                 score_stats_i = precompute_score_stats(
                     clean_subsets[i], params_i, n_samples=50,
                     evidence_fns=EVIDENCE_FNS,
+                    quantile_bounds=[None, (0.025, 0.5)],
                 )
                 clean_train_ds = add_synthetic_noise(
                     clean_train_ds, params_i, score_stats=score_stats_i,
-                    z_lower=0, z_upper=1, evidence_fns=EVIDENCE_FNS,
+                    evidence_fns=EVIDENCE_FNS,
+                    z_lower=2, z_upper=-1,
+                    quantile_bounds=[None, (0.025, 0.5)],
                 )
                 streams_train.append(clean_train_ds)
                 streams_val.append(clean_val_ds)

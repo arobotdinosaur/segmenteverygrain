@@ -18,7 +18,7 @@ import cv2
 from skimage.measure import label, regionprops
 from scipy.stats import wasserstein_distance
 
-from surrogate_gp import evaluate_model_masks, dice_loss, count_penalty
+from surrogate_gp import evaluate_model_masks, dice_loss, count_penalty, EVAL_WITHIN_MASK
 from create_synthetic_images import load_image_mask_pairs
 
 # ═══════════════════════════════════════════════════════════════════
@@ -103,15 +103,16 @@ MODELS = [
 """+[(f"multipleNoise{i}",f"./multipleNoise_{i}.keras","unet") for i in range (10)
 ]"""
 
-MODELS = [
-        ("multipleNoiseHardOneSeed0","./reproduceNoiseTest_0.keras","unet"),
-        ("multipleNoiseHardOneSeed1","./reproduceNoiseTest_1.keras","unet"),
-        ("multipleNoiseHardOneSeed2","./reproduceNoiseTest_2.keras","unet"),
-]
+MODELS = [(f"seed{i}MultipleNoiseSSIM",f"./seededModels/multipleNoiseSSIMReproducible_seed{i}.keras","unet") for i in range(10,20)]+ [(f"seed{i}Baseline",f"./seededModels/baselineReproducible_seed{i}.keras","unet") for i in range(10,20)]
+
+"""MODELS=[(f"seed{i}Baseline",f"./seededModels/baselineReproducible_seed{i}.keras","unet") for i in range(10,20)]\
++[(f"seed{i}MultipleNoise",f"./seededModels/multipleNoiseNotSharedReproducible_seed{i}.keras","unet") for i in range(10,20)]"""
+
+
 
 IMAGE_DIRS = ["./withheldNoisyTestImages/confident_style(model_style)/"]
 PATCH_DIR = "./model_comparison_workspace"
-OUTPUT_DIR = "./model_comparison_metricsReproduce5"
+OUTPUT_DIR = "./model_comparison_metricsReproduce3"
 SHOW_COMPARISON_CHART = True
 
 NUM_CLASSES = 3          # 0 = background, 1 = grain, 2 = boundary
@@ -128,10 +129,16 @@ def compute_pixel_accuracy(pred_probs, true_masks):
         w = min(pred.shape[1], true.shape[1])
         pred_label = np.argmax(pred[:h, :w], axis=-1)
         true_label = true[:h, :w]
-        total = h * w
-        if total == 0:
-            continue
-        per_image.append(float(np.sum(pred_label == true_label)) / total)
+        if EVAL_WITHIN_MASK:
+            known = true_label != 0
+            if not np.any(known):
+                continue
+            per_image.append(float(np.sum(pred_label[known] == true_label[known])) / np.sum(known))
+        else:
+            total = h * w
+            if total == 0:
+                continue
+            per_image.append(float(np.sum(pred_label == true_label)) / total)
     return float(np.mean(per_image)) if per_image else 0.0
 
 # ═══════════════════════════════════════════════════════════════════
@@ -145,6 +152,13 @@ def _per_class_tp_fp_fn(pred_probs, true_masks, class_idx):
         w = min(pred.shape[1], true.shape[1])
         pred_label = np.argmax(pred[:h, :w], axis=-1)
         true_label = true[:h, :w]
+        if EVAL_WITHIN_MASK:
+            known = true_label != 0
+            if not np.any(known):
+                per_image.append((0, 0, 0))
+                continue
+            pred_label = pred_label[known]
+            true_label = true_label[known]
         tp = int(np.sum((pred_label == class_idx) & (true_label == class_idx)))
         fp = int(np.sum((pred_label == class_idx) & (true_label != class_idx)))
         fn = int(np.sum((pred_label != class_idx) & (true_label == class_idx)))
@@ -204,7 +218,7 @@ def _grain_instances(masks):
     all_regions = []
     for m in masks:
         grain = (m == INTERIOR)
-        instances = label(grain, connectivity=1)
+        instances = label(grain, connectivity=2)
         all_instances.append(instances)
         all_regions.append(regionprops(instances))
     return all_instances, all_regions
